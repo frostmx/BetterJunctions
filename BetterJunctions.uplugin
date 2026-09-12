@@ -1,0 +1,30 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"SemVersion": "1.0.0",
+	"FriendlyName": "Better Junctions",
+	"Description": "Stops self-driving trucks from gridlocking at crossroads: a truck queued behind a standing truck no longer keeps junction blocks reserved ahead of it. Server-side only, clients need nothing.",
+	"Category": "Gameplay",
+	"CreatedBy": "frostmx",
+	"CanContainContent": false,
+	"RequiredOnRemote": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "BetterJunctions",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "SML",
+			"Enabled": true,
+			"SemVersion": "^3.12.0"
+		}
+	],
+	"GameVersion": ">=502094"
+}
