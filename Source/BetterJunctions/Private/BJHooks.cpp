@@ -27,6 +27,8 @@ namespace
 	constexpr float LeaderStandingSpeed = 100.0f;
 	/** Our own speed below this counts as standing. */
 	constexpr float SelfStandingSpeed = 30.0f;
+	/** How far ahead the booking filter looks for a standing vehicle. The game's own stop-target lookahead was measured at 1800. */
+	constexpr float AvoidanceLookahead = 3000.0f;
 	/** How long a truck may stand behind a standing truck before its reservations are dropped. */
 	constexpr float WatchdogGraceSeconds = 5.0f;
 	/** Forgotten watchdog entries are swept this often. */
@@ -104,18 +106,20 @@ namespace
 
 void FBetterJunctionsHooks::Install()
 {
-	// Prevention. CalculatePathReservationStopTarget books the junction blocks within the
-	// lookahead and reports where the booked stretch ends. It runs on a worker thread inside the
-	// parallel autopilot tick; CalculateVehicleAvoidanceTarget is what the same tick uses to
-	// look for vehicles ahead, so calling it from here adds no new shared state.
-	Installing(TEXT("UFGVehicleAutopilotComponent::CalculatePathReservationStopTarget"));
-	SUBSCRIBE_METHOD(UFGVehicleAutopilotComponent::CalculatePathReservationStopTarget,
-		[](auto& Scope, const UFGVehicleAutopilotComponent* Self, float MaxLookaheadDistance, float VehicleHalfLength, TArray<FVehicleStopTarget>& OutStopTargets)
+	// Prevention. ReserveVehiclePathBlocks_Parallel is the one place blocks get booked, and the
+	// list it receives is not bounded by the stop-target lookahead: a truck standing 5 cm behind
+	// another was measured booking the junction two blocks past it (clamping the lookahead in
+	// CalculatePathReservationStopTarget changed nothing). So the list itself is filtered: every
+	// block beyond a standing truck ahead is dropped. Runs on a worker thread inside the parallel
+	// autopilot tick; the helpers used are the ones that tick calls on the same thread.
+	Installing(TEXT("UFGVehicleAutopilotComponent::ReserveVehiclePathBlocks_Parallel"));
+	SUBSCRIBE_METHOD(UFGVehicleAutopilotComponent::ReserveVehiclePathBlocks_Parallel,
+		[](auto& Scope, UFGVehicleAutopilotComponent* Self, const TArray<FVehicleAutopilotBlockReference>& PathBlocks, TSet<FVehiclePathBlockReference>& ReferencedPathBlocks)
 		{
-			const float Clamped = ClampLookaheadToStandingVehicle(Self, MaxLookaheadDistance, VehicleHalfLength);
-			if (Clamped < MaxLookaheadDistance)
+			TArray<FVehicleAutopilotBlockReference> Kept;
+			if (FilterBlocksBeyondStandingVehicle(Self, PathBlocks, Kept))
 			{
-				Scope(Self, Clamped, VehicleHalfLength, OutStopTargets);
+				Scope(Self, Kept, ReferencedPathBlocks);
 			}
 		});
 
@@ -129,29 +133,64 @@ void FBetterJunctionsHooks::Install()
 		});
 }
 
-float FBetterJunctionsHooks::ClampLookaheadToStandingVehicle(const UFGVehicleAutopilotComponent* Autopilot, float MaxLookahead, float VehicleHalfLength)
+bool FBetterJunctionsHooks::FilterBlocksBeyondStandingVehicle(const UFGVehicleAutopilotComponent* Autopilot,
+	const TArray<FVehicleAutopilotBlockReference>& PathBlocks, TArray<FVehicleAutopilotBlockReference>& OutKept)
 {
-	TArray<FVehicleStopTarget> Ahead;
-	Autopilot->CalculateVehicleAvoidanceTarget(MaxLookahead, VehicleHalfLength, Ahead);
+	if (PathBlocks.Num() == 0)
+	{
+		return false;
+	}
+	const AFGWheeledVehicle* Vehicle = Cast<AFGWheeledVehicle>(Autopilot->GetOwner());
+	if (!Vehicle)
+	{
+		return false;
+	}
 
-	float Clamped = MaxLookahead;
+	// A moving leader is left alone on purpose: the follower may book past it, as in the
+	// unmodded game, and the two sort themselves out by speed matching. Only a standing one
+	// matters: the follower has to stop behind it, so nothing past it can be of use, and a
+	// booking past it is exactly what locks the leader out of the junction.
+	TArray<FVehicleStopTarget> Ahead;
+	Autopilot->CalculateVehicleAvoidanceTarget(AvoidanceLookahead, UFGVehicleAutopilotComponent::CalculateVehicleHalfLength(Vehicle), Ahead);
+	float LeaderDistance = TNumericLimits<float>::Max();
 	for (const FVehicleStopTarget& Target : Ahead)
 	{
-		// A moving leader is left alone on purpose: clamping to it would turn its tail into a
-		// stop target and make convoys crawl. Only a standing one has to be respected, and the
-		// follower has to stop there anyway.
 		if (Target.TargetMovementSpeed.IsSet() && Target.TargetMovementSpeed.GetValue() < LeaderStandingSpeed)
 		{
-			Clamped = FMath::Min(Clamped, FMath::Max(Target.DistanceToStopTarget, 0.0f));
+			LeaderDistance = FMath::Min(LeaderDistance, FMath::Max(Target.DistanceToStopTarget, 0.0f));
 		}
 	}
-
-	if (Clamped < MaxLookahead)
+	if (LeaderDistance == TNumericLimits<float>::Max())
 	{
-		UE_LOG(LogBetterJunctions, Verbose, TEXT("%s: lookahead %.0f -> %.0f, standing vehicle ahead"),
-			*VehicleLabel(Autopilot), MaxLookahead, Clamped);
+		return false;
 	}
-	return Clamped;
+
+	FVehicleAutopilotBlockReference Current;
+	float DistanceToEndOfCurrentBlock = 0.0f;
+	if (!Autopilot->FindPathBlockFromVehiclePosition(Autopilot->mCurrentServerVehicleSplinePosition, Current, DistanceToEndOfCurrentBlock))
+	{
+		return false;
+	}
+
+	OutKept.Reset(PathBlocks.Num());
+	for (const FVehicleAutopilotBlockReference& Block : PathBlocks)
+	{
+		// The block under the truck is always kept, and so is any block that starts short of
+		// the standing leader (including the one the leader stands in: the follower is next in
+		// line for it and holding it keeps cross traffic from cutting in).
+		if (Block == Current || Autopilot->CalculateTotalDistanceBetweenPathBlocks(Current, Block) <= LeaderDistance)
+		{
+			OutKept.Add(Block);
+		}
+	}
+	if (OutKept.Num() == PathBlocks.Num())
+	{
+		return false;
+	}
+
+	UE_LOG(LogBetterJunctions, Verbose, TEXT("%s: booking %d of %d block(s), standing vehicle %.0f cm ahead"),
+		*VehicleLabel(Autopilot), OutKept.Num(), PathBlocks.Num(), LeaderDistance);
+	return true;
 }
 
 bool FBetterJunctionsHooks::IsStandingBehindStandingVehicle(const UFGVehicleAutopilotComponent* Autopilot)

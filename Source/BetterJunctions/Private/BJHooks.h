@@ -37,8 +37,14 @@ public:
 	static int32 PurgeGhostReservations(UWorld* World);
 
 private:
-	/** Pre-hook: reservation lookahead never extends past a standing truck ahead. */
-	static float ClampLookaheadToStandingVehicle(const UFGVehicleAutopilotComponent* Autopilot, float MaxLookahead, float VehicleHalfLength);
+	/**
+	 * Pre-hook of the booking call: drops every block that lies beyond a standing truck ahead.
+	 * Returns false when nothing has to change (no standing truck, or all blocks are short of it),
+	 * true with the filtered list in OutKept otherwise. The booking call also fills the set of
+	 * blocks the game keeps, so blocks dropped here are released by the game's own cleanup.
+	 */
+	static bool FilterBlocksBeyondStandingVehicle(const UFGVehicleAutopilotComponent* Autopilot,
+		const TArray<struct FVehicleAutopilotBlockReference>& PathBlocks, TArray<struct FVehicleAutopilotBlockReference>& OutKept);
 
 	/** Post-hook of the subsystem autopilot tick: the standing-behind-standing watchdog. */
 	static void TickWatchdog(AFGVehicleSubsystem* Subsystem, float DeltaTime);

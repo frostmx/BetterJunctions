@@ -16,9 +16,10 @@ DECLARE_LOG_CATEGORY_EXTERN(LogBetterJunctions, Log, All);
  * 120 s deadlock timer only counts the latter. Every truck that then arrives at any of the
  * crossing lanes queues behind one of the two.
  *
- * Two server-side hooks close the hole: reservation lookahead is clamped to a standing truck
- * ahead, and a watchdog releases the reservations of a truck that has been standing behind a
- * standing truck for a few seconds. Nothing is replicated, so the mod is server-only.
+ * Two server-side hooks close the hole: the booking call is filtered so that no block beyond a
+ * standing truck ahead is ever booked (the game's own cleanup then drops the ones already held),
+ * and a watchdog releases the reservations of a truck that has been standing behind a standing
+ * truck for a few seconds. Nothing is replicated, so the mod is server-only.
  */
 class FBetterJunctionsModule : public IModuleInterface
 {
