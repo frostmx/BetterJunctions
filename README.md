@@ -25,14 +25,24 @@ seconds and the fourth as soon as the first one emptied.
 Two SML hooks, both on the authority only:
 
 - **Prevention.** A pre-hook on `ReserveVehiclePathBlocks_Parallel`, the only place where blocks
-  get booked. If a truck is standing ahead (a vehicle-avoidance target slower than 1 m/s), every
-  block that starts beyond it is dropped from the list to book
-  (`CalculateTotalDistanceBetweenPathBlocks` from the current block). The same list also fills
-  the set of "wanted" blocks the game uses to clean up surplus reservations, so blocks already
-  held beyond the leader are released in the same tick. The first version clamped the lookahead
-  in `CalculatePathReservationStopTarget` instead; measurement showed that this has no effect on
-  booking: a truck 5 cm behind a standing truck still took a junction block two blocks ahead. A
-  moving leader is deliberately left alone.
+  get booked, with two rules keyed on the nearest vehicle ahead (`CalculateVehicleAvoidanceTarget`):
+  - *standing leader*: if a truck is standing ahead (slower than 1 m/s), every block that starts
+    beyond it is dropped from the list to book (`CalculateTotalDistanceBetweenPathBlocks` from the
+    current block). The same list also fills the set of "wanted" blocks the game uses to clean up
+    surplus reservations, so blocks already held beyond the leader are released in the same tick.
+    A moving leader is deliberately left alone;
+  - *junction entry*: a truck does not book its way into a junction unless it can leave it. If a
+    slow vehicle ahead (slower than 3 m/s) leaves less room than the distance to the junction's
+    exit plus the truck's own length plus 2 m, the junction blocks and everything after them are
+    dropped, and the truck waits at the entrance. The game only checks that the exit block can be
+    booked, not that it is free of a queue, so a queue backing up through a junction left trucks
+    standing inside it, holding its blocks, and the heads of two queues Deadlocked on blocks that
+    overlapped those (measured 12.09.2026 on a dedicated server). A truck already inside a
+    junction is never held back: it has to leave.
+
+  The first version clamped the lookahead in `CalculatePathReservationStopTarget` instead;
+  measurement showed that this has no effect on booking: a truck 5 cm behind a standing truck
+  still took a junction block two blocks ahead.
 - **Cure.** A post-hook on `AFGVehicleSubsystem::TickVehicleAutopilot`: a truck that has been
   standing behind a standing truck for 5 seconds while holding reservations releases them
   (`ReleaseVehiclePathBlockReservations_Parallel`), once per standing episode. After the release
@@ -46,14 +56,15 @@ Both methods are protected; access goes through friend access transformers
 ## Console commands
 
 - `BJ.Dump` — every truck on autopilot: status, speed, time waited on a block, number of
-  reservations, stop target, how long it has been standing behind a standing truck.
+  reservations, stop target, how long it has been standing behind a standing truck. A truck
+  waiting on a block also shows which block (`awaiting <segment>#<index>`) and who holds it.
 - `BJ.Unstick` — release the reservations of every truck standing behind a standing truck right
   now, without the 5-second delay.
 - `BJ.Blocks [filter]` — every reservation straight from the segments' block arrays (reflection
   cannot see them): exclusive ones with their owner, shared ones with the exclusive they belong
   to, and a GHOST mark on those nobody references any more.
 - `BJ.Purge` — release every ghost reservation found by the same walk.
-- `Log LogBetterJunctions Verbose` — log every trimmed booking list.
+- `Log LogBetterJunctions Verbose` — log every trimmed booking list with the rule that trimmed it.
 
 Command output goes to the console it was typed in and to the log.
 
