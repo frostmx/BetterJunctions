@@ -21,20 +21,20 @@ public:
 	static void Install();
 
 	/** Prints every autopilot truck with speed, stop target and reservation count. BJ.Dump */
-	static void DumpVehicles(UWorld* World);
+	static void DumpVehicles(UWorld* World, FOutputDevice* Ar = nullptr);
 
 	/** Releases reservations of every truck standing behind a standing truck. BJ.Unstick */
-	static int32 ReleaseStandingReservations(UWorld* World);
+	static int32 ReleaseStandingReservations(UWorld* World, FOutputDevice* Ar = nullptr);
 
 	/**
 	 * Lists every exclusive and shared reservation held in the segments' own block arrays, with
 	 * its owner and whether the owner still references it. Reflection cannot see these arrays;
 	 * a reservation nobody references is a ghost and blocks the junction forever. BJ.Blocks [filter]
 	 */
-	static void DumpBlockReservations(UWorld* World, const FString& Filter);
+	static void DumpBlockReservations(UWorld* World, const FString& Filter, FOutputDevice* Ar = nullptr);
 
 	/** Releases every ghost reservation found by the same walk. BJ.Purge */
-	static int32 PurgeGhostReservations(UWorld* World);
+	static int32 PurgeGhostReservations(UWorld* World, FOutputDevice* Ar = nullptr);
 
 private:
 	/**
@@ -50,7 +50,7 @@ private:
 	static void TickWatchdog(AFGVehicleSubsystem* Subsystem, float DeltaTime);
 
 	static bool IsStandingBehindStandingVehicle(const UFGVehicleAutopilotComponent* Autopilot);
-	static void ReleaseReservations(UFGVehicleAutopilotComponent* Autopilot, const TCHAR* Reason);
+	static void ReleaseReservations(UFGVehicleAutopilotComponent* Autopilot, const TCHAR* Reason, FOutputDevice* Ar);
 
 	/** True if the owner vehicle's autopilot still has this exclusive reservation in its map. */
 	static bool IsReferencedByOwner(const TSharedPtr<struct FVehiclePathBlockExclusiveReservation>& Exclusive);

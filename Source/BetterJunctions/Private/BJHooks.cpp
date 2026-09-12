@@ -51,6 +51,17 @@ namespace
 		UE_LOG(LogBetterJunctions, Display, TEXT("installing: %s"), Target);
 	}
 
+	/** Command output goes to the log as before and, when a console asked, to that console too. */
+	void Say(FOutputDevice* Ar, const FString& Line)
+	{
+		UE_LOG(LogBetterJunctions, Display, TEXT("%s"), *Line);
+		if (Ar)
+		{
+			Ar->Logf(TEXT("%s"), *Line);
+		}
+	}
+	void Say(FOutputDevice& Ar, const FString& Line) { Say(&Ar, Line); }
+
 	/** Short, stable label: the actor name tail, since the display name changes with the route. */
 	FString ObjectTag(const UObject* Object)
 	{
@@ -69,38 +80,38 @@ namespace
 		return VehicleLabel(Autopilot ? Cast<AFGWheeledVehicle>(Autopilot->GetOwner()) : nullptr);
 	}
 
-	FAutoConsoleCommandWithWorldAndArgs GDumpCommand(
+	FAutoConsoleCommandWithWorldArgsAndOutputDevice GDumpCommand(
 		TEXT("BJ.Dump"),
 		TEXT("BetterJunctions: print every autopilot truck with speed, stop target and reservations."),
-		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		FConsoleCommandWithWorldArgsAndOutputDeviceDelegate::CreateLambda([](const TArray<FString>&, UWorld* World, FOutputDevice& Ar)
 		{
-			FBetterJunctionsHooks::DumpVehicles(World);
+			FBetterJunctionsHooks::DumpVehicles(World, &Ar);
 		}));
 
-	FAutoConsoleCommandWithWorldAndArgs GUnstickCommand(
+	FAutoConsoleCommandWithWorldArgsAndOutputDevice GUnstickCommand(
 		TEXT("BJ.Unstick"),
 		TEXT("BetterJunctions: release the reservations of every truck standing behind a standing truck."),
-		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		FConsoleCommandWithWorldArgsAndOutputDeviceDelegate::CreateLambda([](const TArray<FString>&, UWorld* World, FOutputDevice& Ar)
 		{
-			const int32 Released = FBetterJunctionsHooks::ReleaseStandingReservations(World);
-			UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Unstick: released reservations of %d truck(s)"), Released);
+			const int32 Released = FBetterJunctionsHooks::ReleaseStandingReservations(World, &Ar);
+			Say(Ar, FString::Printf(TEXT("BJ.Unstick: released reservations of %d truck(s)"), Released));
 		}));
 
-	FAutoConsoleCommandWithWorldAndArgs GBlocksCommand(
+	FAutoConsoleCommandWithWorldArgsAndOutputDevice GBlocksCommand(
 		TEXT("BJ.Blocks"),
 		TEXT("BetterJunctions: list every path block reservation held by the segments, with owners and ghosts. Optional argument filters by segment name."),
-		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		FConsoleCommandWithWorldArgsAndOutputDeviceDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World, FOutputDevice& Ar)
 		{
-			FBetterJunctionsHooks::DumpBlockReservations(World, Args.Num() > 0 ? Args[0] : FString());
+			FBetterJunctionsHooks::DumpBlockReservations(World, Args.Num() > 0 ? Args[0] : FString(), &Ar);
 		}));
 
-	FAutoConsoleCommandWithWorldAndArgs GPurgeCommand(
+	FAutoConsoleCommandWithWorldArgsAndOutputDevice GPurgeCommand(
 		TEXT("BJ.Purge"),
 		TEXT("BetterJunctions: release every ghost path block reservation (one no vehicle references any more)."),
-		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		FConsoleCommandWithWorldArgsAndOutputDeviceDelegate::CreateLambda([](const TArray<FString>&, UWorld* World, FOutputDevice& Ar)
 		{
-			const int32 Purged = FBetterJunctionsHooks::PurgeGhostReservations(World);
-			UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Purge: released %d ghost reservation(s)"), Purged);
+			const int32 Purged = FBetterJunctionsHooks::PurgeGhostReservations(World, &Ar);
+			Say(Ar, FString::Printf(TEXT("BJ.Purge: released %d ghost reservation(s)"), Purged));
 		}));
 }
 
@@ -208,12 +219,12 @@ bool FBetterJunctionsHooks::IsStandingBehindStandingVehicle(const UFGVehicleAuto
 	return Autopilot->mServerClosestStopTarget.TargetMovementSpeed.GetValue() < LeaderStandingSpeed;
 }
 
-void FBetterJunctionsHooks::ReleaseReservations(UFGVehicleAutopilotComponent* Autopilot, const TCHAR* Reason)
+void FBetterJunctionsHooks::ReleaseReservations(UFGVehicleAutopilotComponent* Autopilot, const TCHAR* Reason, FOutputDevice* Ar)
 {
 	const int32 Before = Autopilot->mPathBlockReservations.Num();
 	Autopilot->ReleaseVehiclePathBlockReservations_Parallel();
-	UE_LOG(LogBetterJunctions, Display, TEXT("%s: released %d reservation(s), %d left in map (%s)"),
-		*VehicleLabel(Autopilot), Before, Autopilot->mPathBlockReservations.Num(), Reason);
+	Say(Ar, FString::Printf(TEXT("%s: released %d reservation(s), %d left in map (%s)"),
+		*VehicleLabel(Autopilot), Before, Autopilot->mPathBlockReservations.Num(), Reason));
 }
 
 void FBetterJunctionsHooks::TickWatchdog(AFGVehicleSubsystem* Subsystem, float DeltaTime)
@@ -250,7 +261,7 @@ void FBetterJunctionsHooks::TickWatchdog(AFGVehicleSubsystem* Subsystem, float D
 		// of the leader, and those are worth keeping, they hold the follower's place in line.
 		if (!State.bReleasedThisEpisode && State.StandingSeconds >= WatchdogGraceSeconds && Autopilot->mPathBlockReservations.Num() > 0)
 		{
-			ReleaseReservations(Autopilot, TEXT("standing behind a standing vehicle"));
+			ReleaseReservations(Autopilot, TEXT("standing behind a standing vehicle"), nullptr);
 			State.bReleasedThisEpisode = true;
 		}
 	}
@@ -269,7 +280,7 @@ void FBetterJunctionsHooks::TickWatchdog(AFGVehicleSubsystem* Subsystem, float D
 	}
 }
 
-int32 FBetterJunctionsHooks::ReleaseStandingReservations(UWorld* World)
+int32 FBetterJunctionsHooks::ReleaseStandingReservations(UWorld* World, FOutputDevice* Ar)
 {
 	AFGVehicleSubsystem* Subsystem = AFGVehicleSubsystem::Get(World);
 	if (!IsValid(Subsystem) || Subsystem->GetNetMode() == NM_Client)
@@ -283,22 +294,22 @@ int32 FBetterJunctionsHooks::ReleaseStandingReservations(UWorld* World)
 		UFGVehicleAutopilotComponent* Autopilot = IsValid(Vehicle) ? Vehicle->GetVehicleAutopilotComponent() : nullptr;
 		if (IsValid(Autopilot) && IsStandingBehindStandingVehicle(Autopilot) && Autopilot->mPathBlockReservations.Num() > 0)
 		{
-			ReleaseReservations(Autopilot, TEXT("BJ.Unstick"));
+			ReleaseReservations(Autopilot, TEXT("BJ.Unstick"), Ar);
 			++Released;
 		}
 	}
 	return Released;
 }
 
-void FBetterJunctionsHooks::DumpVehicles(UWorld* World)
+void FBetterJunctionsHooks::DumpVehicles(UWorld* World, FOutputDevice* Ar)
 {
 	AFGVehicleSubsystem* Subsystem = AFGVehicleSubsystem::Get(World);
 	if (!IsValid(Subsystem))
 	{
-		UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Dump: no vehicle subsystem"));
+		Say(Ar, FString::Printf(TEXT("BJ.Dump: no vehicle subsystem")));
 		return;
 	}
-	UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Dump: net mode %d, %d vehicle(s)"), (int32)Subsystem->GetNetMode(), Subsystem->GetAllVehicles().Num());
+	Say(Ar, FString::Printf(TEXT("BJ.Dump: net mode %d, %d vehicle(s)"), (int32)Subsystem->GetNetMode(), Subsystem->GetAllVehicles().Num()));
 	for (AFGWheeledVehicleIdentifier* Id : Subsystem->GetAllVehicles())
 	{
 		if (!IsValid(Id) || !Id->IsAutopilotEnabled())
@@ -309,7 +320,7 @@ void FBetterJunctionsHooks::DumpVehicles(UWorld* World)
 		const UFGVehicleAutopilotComponent* Autopilot = IsValid(Vehicle) ? Vehicle->GetVehicleAutopilotComponent() : nullptr;
 		if (!IsValid(Autopilot))
 		{
-			UE_LOG(LogBetterJunctions, Display, TEXT("  %s: vehicle not loaded"), *Id->GetVehicleName().ToString());
+			Say(Ar, FString::Printf(TEXT("  %s: vehicle not loaded"), *Id->GetVehicleName().ToString()));
 			continue;
 		}
 		FString StopTarget = TEXT("none");
@@ -330,10 +341,10 @@ void FBetterJunctionsHooks::DumpVehicles(UWorld* World)
 		{
 			Standing = FString::Printf(TEXT(", standing behind standing %.0f s%s"), State->StandingSeconds, State->bReleasedThisEpisode ? TEXT(" (released)") : TEXT(""));
 		}
-		UE_LOG(LogBetterJunctions, Display, TEXT("  %s: status %d, speed %.0f, on %s, waited %.0f s on block, reservations %d {%s }, stop target: %s%s"),
+		Say(Ar, FString::Printf(TEXT("  %s: status %d, speed %.0f, on %s, waited %.0f s on block, reservations %d {%s }, stop target: %s%s"),
 			*VehicleLabel(Vehicle), (int32)Id->GetAutopilotErrorStatus(), Autopilot->GetCurrentForwardSpeed(),
 			*ObjectTag(Autopilot->mCurrentServerPathSegment), Autopilot->mTimeSpentWaitingOnCurrentFreeBlock,
-			Autopilot->mPathBlockReservations.Num(), *Reservations, *StopTarget, *Standing);
+			Autopilot->mPathBlockReservations.Num(), *Reservations, *StopTarget, *Standing));
 	}
 }
 
@@ -392,17 +403,17 @@ void FBetterJunctionsHooks::WalkReservations(AFGVehicleSubsystem* Subsystem, con
 	}
 }
 
-void FBetterJunctionsHooks::DumpBlockReservations(UWorld* World, const FString& Filter)
+void FBetterJunctionsHooks::DumpBlockReservations(UWorld* World, const FString& Filter, FOutputDevice* Ar)
 {
 	AFGVehicleSubsystem* Subsystem = AFGVehicleSubsystem::Get(World);
 	if (!IsValid(Subsystem))
 	{
-		UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Blocks: no vehicle subsystem"));
+		Say(Ar, FString::Printf(TEXT("BJ.Blocks: no vehicle subsystem")));
 		return;
 	}
 	int32 Blocks = 0;
 	TArray<FBJGhostReservation> Ghosts;
-	WalkReservations(Subsystem, Filter, Ghosts, [&Blocks](const AFGVehiclePathSegment* Segment, int32 Index, const FVehiclePathBlock& Block)
+	WalkReservations(Subsystem, Filter, Ghosts, [&Blocks, Ar](const AFGVehiclePathSegment* Segment, int32 Index, const FVehiclePathBlock& Block)
 	{
 		++Blocks;
 		FString Line = FString::Printf(TEXT("  %s#%d%s:"), *ObjectTag(Segment), Index, Segment->IsJunctionBlock() ? TEXT(" J") : TEXT(""));
@@ -429,13 +440,13 @@ void FBetterJunctionsHooks::DumpBlockReservations(UWorld* World, const FString& 
 				? FString::Printf(TEXT(" shared for %s#%d of %s"), *ObjectTag(Owner->ReservedSegment.Get()), Owner->ReservedPathBlockIndex, *VehicleLabel(Owner->OwnerVehicle.Get()))
 				: FString(TEXT(" shared GHOST (owner reservation gone)"));
 		}
-		UE_LOG(LogBetterJunctions, Display, TEXT("%s"), *Line);
+		Say(Ar, FString::Printf(TEXT("%s"), *Line));
 	});
-	UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Blocks: %d block(s) with reservations, %d ghost(s)%s"), Blocks, Ghosts.Num(),
-		Filter.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(", filter '%s'"), *Filter));
+	Say(Ar, FString::Printf(TEXT("BJ.Blocks: %d block(s) with reservations, %d ghost(s)%s"), Blocks, Ghosts.Num(),
+		Filter.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(", filter '%s'"), *Filter)));
 }
 
-int32 FBetterJunctionsHooks::PurgeGhostReservations(UWorld* World)
+int32 FBetterJunctionsHooks::PurgeGhostReservations(UWorld* World, FOutputDevice* Ar)
 {
 	AFGVehicleSubsystem* Subsystem = AFGVehicleSubsystem::Get(World);
 	if (!IsValid(Subsystem) || Subsystem->GetNetMode() == NM_Client)
@@ -456,13 +467,13 @@ int32 FBetterJunctionsHooks::PurgeGhostReservations(UWorld* World)
 		}
 		if (Ghost.Exclusive.IsValid())
 		{
-			UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Purge: exclusive %s#%d owned by %s"), *ObjectTag(Segment), Ghost.Exclusive->ReservedPathBlockIndex, *VehicleLabel(Ghost.Exclusive->OwnerVehicle.Get()));
+			Say(Ar, FString::Printf(TEXT("BJ.Purge: exclusive %s#%d owned by %s"), *ObjectTag(Segment), Ghost.Exclusive->ReservedPathBlockIndex, *VehicleLabel(Ghost.Exclusive->OwnerVehicle.Get())));
 			Segment->ReleaseExclusiveReservation_ThreadSafe(Ghost.Exclusive);
 			++Purged;
 		}
 		else if (Ghost.Shared.IsValid())
 		{
-			UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Purge: shared %s#%d"), *ObjectTag(Segment), Ghost.Shared->ReservedPathBlockIndex);
+			Say(Ar, FString::Printf(TEXT("BJ.Purge: shared %s#%d"), *ObjectTag(Segment), Ghost.Shared->ReservedPathBlockIndex));
 			Segment->ReleaseSharedReservation_ThreadSafe(Ghost.Shared);
 			++Purged;
 		}
