@@ -26,6 +26,16 @@ public:
 	/** Releases reservations of every truck standing behind a standing truck. BJ.Unstick */
 	static int32 ReleaseStandingReservations(UWorld* World);
 
+	/**
+	 * Lists every exclusive and shared reservation held in the segments' own block arrays, with
+	 * its owner and whether the owner still references it. Reflection cannot see these arrays;
+	 * a reservation nobody references is a ghost and blocks the junction forever. BJ.Blocks [filter]
+	 */
+	static void DumpBlockReservations(UWorld* World, const FString& Filter);
+
+	/** Releases every ghost reservation found by the same walk. BJ.Purge */
+	static int32 PurgeGhostReservations(UWorld* World);
+
 private:
 	/** Pre-hook: reservation lookahead never extends past a standing truck ahead. */
 	static float ClampLookaheadToStandingVehicle(const UFGVehicleAutopilotComponent* Autopilot, float MaxLookahead, float VehicleHalfLength);
@@ -35,4 +45,15 @@ private:
 
 	static bool IsStandingBehindStandingVehicle(const UFGVehicleAutopilotComponent* Autopilot);
 	static void ReleaseReservations(UFGVehicleAutopilotComponent* Autopilot, const TCHAR* Reason);
+
+	/** True if the owner vehicle's autopilot still has this exclusive reservation in its map. */
+	static bool IsReferencedByOwner(const TSharedPtr<struct FVehiclePathBlockExclusiveReservation>& Exclusive);
+
+	/**
+	 * Walks every block of every segment under the segment's read lock, calling OnBlock for each
+	 * block that holds any reservation and collecting ghosts. Nothing may be released inside the
+	 * walk: the release functions take the same lock.
+	 */
+	static void WalkReservations(AFGVehicleSubsystem* Subsystem, const FString& Filter, TArray<struct FBJGhostReservation>& OutGhosts,
+		const TFunctionRef<void(const class AFGVehiclePathSegment*, int32, const struct FVehiclePathBlock&)>& OnBlock);
 };

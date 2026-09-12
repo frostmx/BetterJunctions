@@ -4,9 +4,18 @@
 #include "Patching/NativeHookManager.h"
 
 #include "WheeledVehicles/FGVehicleAutopilotComponent.h"
+#include "WheeledVehicles/FGVehiclePathSegment.h"
 #include "WheeledVehicles/FGVehicleSubsystem.h"
 #include "WheeledVehicles/FGWheeledVehicle.h"
 #include "WheeledVehicles/FGWheeledVehicleIdentifier.h"
+
+/** A reservation found in a segment's block arrays that no vehicle references any more. */
+struct FBJGhostReservation
+{
+	TWeakObjectPtr<AFGVehiclePathSegment> Segment;
+	TSharedPtr<FVehiclePathBlockExclusiveReservation> Exclusive;
+	TSharedPtr<FVehiclePathBlockSharedReservation> Shared;
+};
 
 namespace
 {
@@ -40,11 +49,22 @@ namespace
 		UE_LOG(LogBetterJunctions, Display, TEXT("installing: %s"), Target);
 	}
 
+	/** Short, stable label: the actor name tail, since the display name changes with the route. */
+	FString ObjectTag(const UObject* Object)
+	{
+		const FString Name = GetNameSafe(Object);
+		return Name.Len() > 10 ? Name.Right(10) : Name;
+	}
+
+	FString VehicleLabel(const AFGWheeledVehicle* Vehicle)
+	{
+		const AFGWheeledVehicleIdentifier* Id = Vehicle ? Vehicle->GetVehicleIdentifier() : nullptr;
+		return FString::Printf(TEXT("%s [%s]"), Id ? *Id->GetVehicleName().ToString() : TEXT("?"), *ObjectTag(Vehicle));
+	}
+
 	FString VehicleLabel(const UFGVehicleAutopilotComponent* Autopilot)
 	{
-		const AFGWheeledVehicle* Vehicle = Autopilot ? Cast<AFGWheeledVehicle>(Autopilot->GetOwner()) : nullptr;
-		const AFGWheeledVehicleIdentifier* Id = Vehicle ? Vehicle->GetVehicleIdentifier() : nullptr;
-		return Id ? Id->GetVehicleName().ToString() : GetNameSafe(Vehicle);
+		return VehicleLabel(Autopilot ? Cast<AFGWheeledVehicle>(Autopilot->GetOwner()) : nullptr);
 	}
 
 	FAutoConsoleCommandWithWorldAndArgs GDumpCommand(
@@ -62,6 +82,23 @@ namespace
 		{
 			const int32 Released = FBetterJunctionsHooks::ReleaseStandingReservations(World);
 			UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Unstick: released reservations of %d truck(s)"), Released);
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs GBlocksCommand(
+		TEXT("BJ.Blocks"),
+		TEXT("BetterJunctions: list every path block reservation held by the segments, with owners and ghosts. Optional argument filters by segment name."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			FBetterJunctionsHooks::DumpBlockReservations(World, Args.Num() > 0 ? Args[0] : FString());
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs GPurgeCommand(
+		TEXT("BJ.Purge"),
+		TEXT("BetterJunctions: release every ghost path block reservation (one no vehicle references any more)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		{
+			const int32 Purged = FBetterJunctionsHooks::PurgeGhostReservations(World);
+			UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Purge: released %d ghost reservation(s)"), Purged);
 		}));
 }
 
@@ -244,13 +281,152 @@ void FBetterJunctionsHooks::DumpVehicles(UWorld* World)
 				? FString::Printf(TEXT("vehicle %.0f cm ahead at %.0f cm/s"), Target.DistanceToStopTarget, Target.TargetMovementSpeed.GetValue())
 				: FString::Printf(TEXT("block or dock in %.0f cm"), Target.DistanceToStopTarget);
 		}
+		FString Reservations;
+		for (const auto& Pair : Autopilot->mPathBlockReservations)
+		{
+			Reservations += FString::Printf(TEXT(" %s#%d"), *ObjectTag(Pair.Key.Segment), Pair.Key.PathBlockIndex);
+		}
 		FString Standing;
 		if (const FStandingState* State = GStanding.Find(Autopilot); State && State->StandingSeconds > 0.0f)
 		{
 			Standing = FString::Printf(TEXT(", standing behind standing %.0f s%s"), State->StandingSeconds, State->bReleasedThisEpisode ? TEXT(" (released)") : TEXT(""));
 		}
-		UE_LOG(LogBetterJunctions, Display, TEXT("  %s: status %d, speed %.0f, waited %.0f s on block, reservations %d, stop target: %s%s"),
-			*Id->GetVehicleName().ToString(), (int32)Id->GetAutopilotErrorStatus(), Autopilot->GetCurrentForwardSpeed(),
-			Autopilot->mTimeSpentWaitingOnCurrentFreeBlock, Autopilot->mPathBlockReservations.Num(), *StopTarget, *Standing);
+		UE_LOG(LogBetterJunctions, Display, TEXT("  %s: status %d, speed %.0f, on %s, waited %.0f s on block, reservations %d {%s }, stop target: %s%s"),
+			*VehicleLabel(Vehicle), (int32)Id->GetAutopilotErrorStatus(), Autopilot->GetCurrentForwardSpeed(),
+			*ObjectTag(Autopilot->mCurrentServerPathSegment), Autopilot->mTimeSpentWaitingOnCurrentFreeBlock,
+			Autopilot->mPathBlockReservations.Num(), *Reservations, *StopTarget, *Standing);
 	}
+}
+
+bool FBetterJunctionsHooks::IsReferencedByOwner(const TSharedPtr<FVehiclePathBlockExclusiveReservation>& Exclusive)
+{
+	const AFGWheeledVehicle* Vehicle = Exclusive->OwnerVehicle.Get();
+	const UFGVehicleAutopilotComponent* Autopilot = IsValid(Vehicle) ? Vehicle->GetVehicleAutopilotComponent() : nullptr;
+	if (!IsValid(Autopilot))
+	{
+		return false;
+	}
+	for (const auto& Pair : Autopilot->mPathBlockReservations)
+	{
+		if (Pair.Value.Reservation.Get() == Exclusive.Get())
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+void FBetterJunctionsHooks::WalkReservations(AFGVehicleSubsystem* Subsystem, const FString& Filter, TArray<FBJGhostReservation>& OutGhosts,
+	const TFunctionRef<void(const AFGVehiclePathSegment*, int32, const FVehiclePathBlock&)>& OnBlock)
+{
+	for (AFGVehiclePathSegment* Segment : Subsystem->mAllPathSegments)
+	{
+		if (!IsValid(Segment) || (!Filter.IsEmpty() && !Segment->GetName().Contains(Filter)))
+		{
+			continue;
+		}
+		FReadScopeLock Lock(Segment->mPathBlocksLock);
+		const TArray<FVehiclePathBlock>& Blocks = Segment->GetVehiclePathBlocks();
+		for (int32 Index = 0; Index < Blocks.Num(); ++Index)
+		{
+			const FVehiclePathBlock& Block = Blocks[Index];
+			if (Block.ExclusiveReservations.Num() == 0 && Block.SharedReservations.Num() == 0)
+			{
+				continue;
+			}
+			OnBlock(Segment, Index, Block);
+			for (const auto& Exclusive : Block.ExclusiveReservations)
+			{
+				if (Exclusive.IsValid() && !IsReferencedByOwner(Exclusive))
+				{
+					OutGhosts.Add({Segment, Exclusive, nullptr});
+				}
+			}
+			for (const auto& Shared : Block.SharedReservations)
+			{
+				if (Shared.IsValid() && !Shared->OwnerReservation.IsValid())
+				{
+					OutGhosts.Add({Segment, nullptr, Shared});
+				}
+			}
+		}
+	}
+}
+
+void FBetterJunctionsHooks::DumpBlockReservations(UWorld* World, const FString& Filter)
+{
+	AFGVehicleSubsystem* Subsystem = AFGVehicleSubsystem::Get(World);
+	if (!IsValid(Subsystem))
+	{
+		UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Blocks: no vehicle subsystem"));
+		return;
+	}
+	int32 Blocks = 0;
+	TArray<FBJGhostReservation> Ghosts;
+	WalkReservations(Subsystem, Filter, Ghosts, [&Blocks](const AFGVehiclePathSegment* Segment, int32 Index, const FVehiclePathBlock& Block)
+	{
+		++Blocks;
+		FString Line = FString::Printf(TEXT("  %s#%d%s:"), *ObjectTag(Segment), Index, Segment->IsJunctionBlock() ? TEXT(" J") : TEXT(""));
+		for (const auto& Exclusive : Block.ExclusiveReservations)
+		{
+			if (!Exclusive.IsValid())
+			{
+				Line += TEXT(" exclusive(null)");
+				continue;
+			}
+			const AFGWheeledVehicle* Owner = Exclusive->OwnerVehicle.Get();
+			Line += FString::Printf(TEXT(" exclusive by %s%s (%d shared)"), *VehicleLabel(Owner),
+				IsReferencedByOwner(Exclusive) ? TEXT("") : TEXT(" GHOST"), Exclusive->SharedReservations.Num());
+		}
+		for (const auto& Shared : Block.SharedReservations)
+		{
+			if (!Shared.IsValid())
+			{
+				Line += TEXT(" shared(null)");
+				continue;
+			}
+			const TSharedPtr<FVehiclePathBlockExclusiveReservation> Owner = Shared->OwnerReservation.Pin();
+			Line += Owner.IsValid()
+				? FString::Printf(TEXT(" shared for %s#%d of %s"), *ObjectTag(Owner->ReservedSegment.Get()), Owner->ReservedPathBlockIndex, *VehicleLabel(Owner->OwnerVehicle.Get()))
+				: FString(TEXT(" shared GHOST (owner reservation gone)"));
+		}
+		UE_LOG(LogBetterJunctions, Display, TEXT("%s"), *Line);
+	});
+	UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Blocks: %d block(s) with reservations, %d ghost(s)%s"), Blocks, Ghosts.Num(),
+		Filter.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(", filter '%s'"), *Filter));
+}
+
+int32 FBetterJunctionsHooks::PurgeGhostReservations(UWorld* World)
+{
+	AFGVehicleSubsystem* Subsystem = AFGVehicleSubsystem::Get(World);
+	if (!IsValid(Subsystem) || Subsystem->GetNetMode() == NM_Client)
+	{
+		return 0;
+	}
+	TArray<FBJGhostReservation> Ghosts;
+	WalkReservations(Subsystem, FString(), Ghosts, [](const AFGVehiclePathSegment*, int32, const FVehiclePathBlock&) {});
+
+	// Released outside the walk: the release functions take the segment lock for writing.
+	int32 Purged = 0;
+	for (const FBJGhostReservation& Ghost : Ghosts)
+	{
+		AFGVehiclePathSegment* Segment = Ghost.Segment.Get();
+		if (!IsValid(Segment))
+		{
+			continue;
+		}
+		if (Ghost.Exclusive.IsValid())
+		{
+			UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Purge: exclusive %s#%d owned by %s"), *ObjectTag(Segment), Ghost.Exclusive->ReservedPathBlockIndex, *VehicleLabel(Ghost.Exclusive->OwnerVehicle.Get()));
+			Segment->ReleaseExclusiveReservation_ThreadSafe(Ghost.Exclusive);
+			++Purged;
+		}
+		else if (Ghost.Shared.IsValid())
+		{
+			UE_LOG(LogBetterJunctions, Display, TEXT("BJ.Purge: shared %s#%d"), *ObjectTag(Segment), Ghost.Shared->ReservedPathBlockIndex);
+			Segment->ReleaseSharedReservation_ThreadSafe(Ghost.Shared);
+			++Purged;
+		}
+	}
+	return Purged;
 }
