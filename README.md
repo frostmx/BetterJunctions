@@ -22,7 +22,8 @@ seconds and the fourth as soon as the first one emptied.
 
 ## What the mod does
 
-Two SML hooks, both on the authority only:
+Two SML hooks, both on the authority only. The pre-hook carries three rules; the last two were
+added after the first build met two further kinds of jam on a dedicated server.
 
 - **Prevention.** A pre-hook on `ReserveVehiclePathBlocks_Parallel`, the only place where blocks
   get booked, with two rules keyed on the nearest vehicle ahead (`CalculateVehicleAvoidanceTarget`):
@@ -40,6 +41,20 @@ Two SML hooks, both on the authority only:
     overlapped those (measured 12.09.2026 on a dedicated server). A truck already inside a
     junction is never held back: it has to leave.
 
+  - *junction priority*: a truck that has waited ten seconds on a junction claims it, and nobody
+    else books that junction (or any segment overlapping its blocks) until the waiter is in.
+    Booking needs every block of the sequence free at the moment of the attempt, and a crossing
+    with steady traffic never has that moment for a truck that needs more of it than the passing
+    ones do: measured 12.09.2026, a truck waited twelve minutes at a crossing with a different
+    fuel truck inside it at every look, while the queue behind it backed up through two other
+    junctions. Longest wait wins; a waiter whose junction is already claimed by a longer one
+    stays out, so two trucks on crossing paths never hold each other back; a truck already
+    inside a junction is never held back. The claim is rebuilt after every autopilot tick.
+
+  The vehicle ahead is looked for 80 m along the path: a connector between two roads 32 m
+  apart was entered with a 30 m lookahead because the standing truck past its exit was just
+  out of sight.
+
   The first version clamped the lookahead in `CalculatePathReservationStopTarget` instead;
   measurement showed that this has no effect on booking: a truck 5 cm behind a standing truck
   still took a junction block two blocks ahead.
@@ -56,8 +71,10 @@ Both methods are protected; access goes through friend access transformers
 ## Console commands
 
 - `BJ.Dump` — every truck on autopilot: status, speed, time waited on a block, number of
-  reservations, stop target, how long it has been standing behind a standing truck. A truck
-  waiting on a block also shows which block (`awaiting <segment>#<index>`) and who holds it.
+  reservations, stop target, how long it has been standing behind a standing truck, and
+  `HAS PRIORITY` when it holds a junction claim. A truck
+  waiting on a block also shows the whole block sequence it is trying to book, and for each block
+  what stands in the way: reservations by others, exclusives on overlapping blocks, vehicles inside.
 - `BJ.Unstick` — release the reservations of every truck standing behind a standing truck right
   now, without the 5-second delay.
 - `BJ.Blocks [filter]` — every reservation straight from the segments' block arrays (reflection
@@ -80,7 +97,8 @@ clients) and WindowsServer targets are built.
 The gridlock is hard to reproduce, so verify the other way round. `BJ.Dump` on a live server
 should never show a truck with `reservations > 0`, `speed 0` and a stop target of
 `vehicle … at 0 cm/s` for longer than five seconds. Every such release is logged under
-`LogBetterJunctions` with the truck's name.
+`LogBetterJunctions` with the truck's name, and so is every priority grant
+(`priority at its junction after N s of waiting, M segment(s) claimed`).
 
 Not to be confused with another kind of stop: a truck whose route has only one station (this
 happens after a station is rebuilt, the game removes it from every route) stops where it stands

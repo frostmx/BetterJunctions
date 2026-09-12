@@ -51,13 +51,17 @@ private:
 	static int32 NodeIndexOffset(const UFGVehicleAutopilotComponent* Autopilot, const struct FVehicleAutopilotBlockReference& Current);
 	static const class AFGVehiclePathSegment* ResolveSegment(const UFGVehicleAutopilotComponent* Autopilot, const struct FVehicleAutopilotBlockReference& Block, int32 NodeOffset);
 
-	/** ", awaiting <seg>#<idx> held by ..." for a truck waiting on a block, or empty. BJ.Dump */
+	/** ", sequence { <seg>#<idx>=free|mine|[holders] ... }" for a truck waiting on a block: every block of the pending sequence with what stands in the way. BJ.Dump */
 	static FString DescribeAwaitedBlock(const UFGVehicleAutopilotComponent* Autopilot);
 
 	/** Post-hook of the subsystem autopilot tick: the standing-behind-standing watchdog. */
 	static void TickWatchdog(AFGVehicleSubsystem* Subsystem, float DeltaTime);
 
 	static bool IsStandingBehindStandingVehicle(const UFGVehicleAutopilotComponent* Autopilot);
+	/** Standing on a reservation stop target (a block, not a vehicle) with a pending block sequence. */
+	static bool IsWaitingOnBlock(const UFGVehicleAutopilotComponent* Autopilot);
+	/** Rebuilds the junction priority map from the trucks that have waited long enough on a block. Game thread, post-tick. */
+	static void RebuildPriority(AFGVehicleSubsystem* Subsystem);
 	static void ReleaseReservations(UFGVehicleAutopilotComponent* Autopilot, const TCHAR* Reason, FOutputDevice* Ar);
 
 	/** True if the owner vehicle's autopilot still has this exclusive reservation in its map. */

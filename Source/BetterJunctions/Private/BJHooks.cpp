@@ -35,10 +35,24 @@ namespace
 	constexpr float SlowLeaderSpeed = 300.0f;
 	/** Extra room required past a junction exit, beyond the truck's own length. */
 	constexpr float JunctionExitMargin = 200.0f;
-	/** How far ahead the booking filter looks for a standing vehicle. The game's own stop-target lookahead was measured at 1800. */
-	constexpr float AvoidanceLookahead = 3000.0f;
+	/**
+	 * How far ahead the booking filter looks for a vehicle. The game's own stop-target lookahead
+	 * was measured at 1800. The junction-entry rule needs to see past the junction's exit plus a
+	 * truck length, and a connector between two roads 32 m apart was measured to be entered with
+	 * a 30 m lookahead: the standing truck beyond its exit was just out of sight.
+	 */
+	constexpr float AvoidanceLookahead = 8000.0f;
 	/** How long a truck may stand behind a standing truck before its reservations are dropped. */
 	constexpr float WatchdogGraceSeconds = 5.0f;
+	/**
+	 * How long a truck may wait on a junction before it gets priority there: from then on nobody
+	 * else books that junction until the waiter is in. Booking a junction needs every block of
+	 * the sequence free at the moment of the attempt, and a crossing with steady traffic never
+	 * has that moment for a truck that needs more of it than the passing ones do. Measured
+	 * 12.09.2026 on a dedicated server: a truck waited 12 minutes at a crossing (hours before
+	 * the restart) while a different fuel truck held the crossing at every look.
+	 */
+	constexpr float PriorityWaitSeconds = 10.0f;
 	/** Forgotten watchdog entries are swept this often. */
 	constexpr float WatchdogSweepSeconds = 30.0f;
 
@@ -51,6 +65,15 @@ namespace
 	// Game thread only: written by the subsystem post-tick and the console commands.
 	TMap<TWeakObjectPtr<UFGVehicleAutopilotComponent>, FStandingState> GStanding;
 	float GSinceSweep = 0.0f;
+
+	/**
+	 * Junction segments claimed by a waiting truck, rebuilt after every autopilot tick on the
+	 * game thread and read by the booking filter on the worker threads during the next tick.
+	 * The two never overlap: the post-tick hook runs after the parallel work has been joined.
+	 */
+	TMap<TWeakObjectPtr<const AFGVehiclePathSegment>, TWeakObjectPtr<const UFGVehicleAutopilotComponent>> GPriority;
+	/** Trucks that hold a priority right now, so the log line comes once per wait. */
+	TSet<TWeakObjectPtr<const UFGVehicleAutopilotComponent>> GPriorityLogged;
 
 	void Installing(const TCHAR* Target)
 	{
@@ -200,7 +223,7 @@ bool FBetterJunctionsHooks::FilterBlocksBeyondStandingVehicle(const UFGVehicleAu
 			SlowDistance = FMath::Min(SlowDistance, Distance);
 		}
 	}
-	if (SlowDistance == TNumericLimits<float>::Max())
+	if (SlowDistance == TNumericLimits<float>::Max() && GPriority.Num() == 0)
 	{
 		return false;
 	}
@@ -221,6 +244,8 @@ bool FBetterJunctionsHooks::FilterBlocksBeyondStandingVehicle(const UFGVehicleAu
 	OutKept.Reset(PathBlocks.Num());
 	const TCHAR* Reason = nullptr;
 	float Room = 0.0f;
+	// A truck inside a junction has to leave it whatever anyone is waiting for.
+	const bool bInsideJunction = IsJunction(Current);
 	for (int32 Index = 0; Index < PathBlocks.Num(); ++Index)
 	{
 		const FVehicleAutopilotBlockReference& Block = PathBlocks[Index];
@@ -229,6 +254,19 @@ bool FBetterJunctionsHooks::FilterBlocksBeyondStandingVehicle(const UFGVehicleAu
 		{
 			OutKept.Add(Block);
 			continue;
+		}
+		// Priority: a junction claimed by a truck that has waited long enough on it is not booked
+		// by anyone else until that truck is in.
+		if (!bInsideJunction && GPriority.Num() > 0)
+		{
+			const AFGVehiclePathSegment* Segment = ResolveSegment(Autopilot, Block, NodeOffset);
+			const TWeakObjectPtr<const UFGVehicleAutopilotComponent>* Waiter = Segment ? GPriority.Find(Segment) : nullptr;
+			if (Waiter && Waiter->IsValid() && Waiter->Get() != Autopilot)
+			{
+				Reason = TEXT("junction claimed by a waiting truck");
+				Room = 0.0f;
+				break;
+			}
 		}
 		// Any block that starts short of a standing leader is kept too (including the one the
 		// leader stands in: the follower is next in line for it and holding it keeps cross
@@ -322,48 +360,90 @@ FString FBetterJunctionsHooks::DescribeAwaitedBlock(const UFGVehicleAutopilotCom
 	{
 		return TEXT(", awaiting: route segments unresolved");
 	}
-	// The first block of the pending sequence that the truck does not hold is the one it waits for.
+	const AFGWheeledVehicle* Self = Cast<AFGWheeledVehicle>(Autopilot->GetOwner());
+
+	// Every block of the pending sequence, with what stands in the way of booking it: other
+	// vehicles' reservations on the block itself, other vehicles' exclusives on the blocks that
+	// overlap it (those forbid the shared lock the booking would place there), and vehicles
+	// physically inside the block.
+	const auto ExclusiveHolders = [&](const AFGVehiclePathSegment* Segment, int32 BlockIndex, const TCHAR* Suffix, FString& Out)
+	{
+		FReadScopeLock Lock(Segment->mPathBlocksLock);
+		const TArray<FVehiclePathBlock>& Blocks = Segment->GetVehiclePathBlocks();
+		if (!Blocks.IsValidIndex(BlockIndex))
+		{
+			return;
+		}
+		for (const auto& Exclusive : Blocks[BlockIndex].ExclusiveReservations)
+		{
+			if (Exclusive.IsValid() && Exclusive->OwnerVehicle.Get() != Self)
+			{
+				Out += FString::Printf(TEXT(" %s%s"), *VehicleLabel(Exclusive->OwnerVehicle.Get()), Suffix);
+			}
+		}
+	};
+	FString Out;
 	for (const FVehicleAutopilotBlockReference& Ref : Autopilot->mNextBlockSequenceReference.GetValue())
 	{
-		AFGVehiclePathSegment* Segment = const_cast<AFGVehiclePathSegment*>(ResolveSegment(Autopilot, Ref, NodeOffset));
+		const AFGVehiclePathSegment* Segment = ResolveSegment(Autopilot, Ref, NodeOffset);
 		if (!Segment)
 		{
+			Out += TEXT(" ?");
 			continue;
 		}
 		FVehiclePathBlockReference Key;
-		Key.Segment = Segment;
+		Key.Segment = const_cast<AFGVehiclePathSegment*>(Segment);
 		Key.PathBlockIndex = Ref.PathBlockIndex;
-		if (Autopilot->mPathBlockReservations.Contains(Key))
-		{
-			continue;
-		}
 		FString Holders;
+		TArray<FVehiclePathBlockReference> Overlapping;
 		{
 			FReadScopeLock Lock(Segment->mPathBlocksLock);
 			const TArray<FVehiclePathBlock>& Blocks = Segment->GetVehiclePathBlocks();
 			if (Blocks.IsValidIndex(Ref.PathBlockIndex))
 			{
-				for (const auto& Exclusive : Blocks[Ref.PathBlockIndex].ExclusiveReservations)
+				const FVehiclePathBlock& Block = Blocks[Ref.PathBlockIndex];
+				for (const auto& Exclusive : Block.ExclusiveReservations)
 				{
-					if (Exclusive.IsValid())
+					if (Exclusive.IsValid() && Exclusive->OwnerVehicle.Get() != Self)
 					{
 						Holders += FString::Printf(TEXT(" %s (exclusive)"), *VehicleLabel(Exclusive->OwnerVehicle.Get()));
 					}
 				}
-				for (const auto& Shared : Blocks[Ref.PathBlockIndex].SharedReservations)
+				for (const auto& Shared : Block.SharedReservations)
 				{
 					const TSharedPtr<FVehiclePathBlockExclusiveReservation> Owner = Shared.IsValid() ? Shared->OwnerReservation.Pin() : nullptr;
-					if (Owner.IsValid())
+					if (Owner.IsValid() && Owner->OwnerVehicle.Get() != Self)
 					{
 						Holders += FString::Printf(TEXT(" %s (shared)"), *VehicleLabel(Owner->OwnerVehicle.Get()));
 					}
 				}
+				Overlapping = Block.OverlappingBlocks;
 			}
 		}
-		return FString::Printf(TEXT(", awaiting %s#%d%s held by%s"), *ObjectTag(Segment), Ref.PathBlockIndex,
-			Segment->IsJunctionBlock() ? TEXT(" J") : TEXT(""), Holders.IsEmpty() ? TEXT(" nobody") : *Holders);
+		for (const FVehiclePathBlockReference& Over : Overlapping)
+		{
+			if (IsValid(Over.Segment))
+			{
+				ExclusiveHolders(Over.Segment, Over.PathBlockIndex, *FString::Printf(TEXT(" (exclusive on overlapping %s#%d)"), *ObjectTag(Over.Segment), Over.PathBlockIndex), Holders);
+			}
+		}
+		for (const AFGWheeledVehicle* Other : Segment->GetVehicles())
+		{
+			if (IsValid(Other) && Other != Self)
+			{
+				const UFGVehicleAutopilotComponent* OtherAutopilot = Other->GetVehicleAutopilotComponent();
+				const int32 OtherBlock = IsValid(OtherAutopilot) && OtherAutopilot->mCurrentServerPathSegment == Segment
+					? Segment->FindVehiclePathBlockIndexAtDistance(OtherAutopilot->mCurrentServerVehicleSplinePosition) : INDEX_NONE;
+				if (OtherBlock == Ref.PathBlockIndex || OtherBlock == INDEX_NONE)
+				{
+					Holders += FString::Printf(TEXT(" %s (inside%s)"), *VehicleLabel(Other), OtherBlock == INDEX_NONE ? TEXT(" segment") : TEXT(""));
+				}
+			}
+		}
+		Out += FString::Printf(TEXT(" %s#%d%s%s"), *ObjectTag(Segment), Ref.PathBlockIndex, Segment->IsJunctionBlock() ? TEXT("J") : TEXT(""),
+			Autopilot->mPathBlockReservations.Contains(Key) ? TEXT("=mine") : Holders.IsEmpty() ? TEXT("=free") : *FString::Printf(TEXT("=[%s ]"), *Holders));
 	}
-	return TEXT(", awaiting: sequence fully held");
+	return FString::Printf(TEXT(", sequence {%s }"), *Out);
 }
 
 bool FBetterJunctionsHooks::IsStandingBehindStandingVehicle(const UFGVehicleAutopilotComponent* Autopilot)
@@ -428,6 +508,8 @@ void FBetterJunctionsHooks::TickWatchdog(AFGVehicleSubsystem* Subsystem, float D
 		}
 	}
 
+	RebuildPriority(Subsystem);
+
 	GSinceSweep += DeltaTime;
 	if (GSinceSweep >= WatchdogSweepSeconds)
 	{
@@ -440,6 +522,97 @@ void FBetterJunctionsHooks::TickWatchdog(AFGVehicleSubsystem* Subsystem, float D
 			}
 		}
 	}
+}
+
+bool FBetterJunctionsHooks::IsWaitingOnBlock(const UFGVehicleAutopilotComponent* Autopilot)
+{
+	// A reservation target has no movement speed; a vehicle-avoidance target does.
+	return FMath::Abs(Autopilot->GetCurrentForwardSpeed()) < SelfStandingSpeed
+		&& Autopilot->mServerClosestStopTargetIsSet && !Autopilot->mServerClosestStopTarget.TargetMovementSpeed.IsSet()
+		&& Autopilot->mNextBlockSequenceReference.IsSet();
+}
+
+void FBetterJunctionsHooks::RebuildPriority(AFGVehicleSubsystem* Subsystem)
+{
+	struct FWaiter
+	{
+		const UFGVehicleAutopilotComponent* Autopilot;
+		float Seconds;
+	};
+	TArray<FWaiter> Waiters;
+	for (AFGWheeledVehicleIdentifier* Id : Subsystem->GetAllVehicles())
+	{
+		const AFGWheeledVehicle* Vehicle = IsValid(Id) && Id->IsAutopilotEnabled() ? Id->GetOwnerVehicle() : nullptr;
+		const UFGVehicleAutopilotComponent* Autopilot = IsValid(Vehicle) ? Vehicle->GetVehicleAutopilotComponent() : nullptr;
+		if (IsValid(Autopilot) && IsWaitingOnBlock(Autopilot) && Autopilot->mTimeSpentWaitingOnCurrentFreeBlock >= PriorityWaitSeconds)
+		{
+			Waiters.Add({Autopilot, Autopilot->mTimeSpentWaitingOnCurrentFreeBlock});
+		}
+	}
+	// Longest wait first. A waiter whose junction is already claimed by a longer one stays out
+	// of the map altogether, so two trucks waiting on crossing paths never hold each other back.
+	Waiters.Sort([](const FWaiter& A, const FWaiter& B) { return A.Seconds > B.Seconds; });
+
+	GPriority.Reset();
+	TSet<TWeakObjectPtr<const UFGVehicleAutopilotComponent>> Holding;
+	for (const FWaiter& Waiter : Waiters)
+	{
+		FVehicleAutopilotBlockReference Current;
+		float DistanceToEnd = 0.0f;
+		if (!Waiter.Autopilot->FindPathBlockFromVehiclePosition(Waiter.Autopilot->mCurrentServerVehicleSplinePosition, Current, DistanceToEnd))
+		{
+			continue;
+		}
+		const int32 NodeOffset = NodeIndexOffset(Waiter.Autopilot, Current);
+		// The sequence's own segments, and the segments of every block overlapping them: those
+		// are what the passing traffic books.
+		TSet<const AFGVehiclePathSegment*> Claimed;
+		for (const FVehicleAutopilotBlockReference& Ref : Waiter.Autopilot->mNextBlockSequenceReference.GetValue())
+		{
+			const AFGVehiclePathSegment* Segment = ResolveSegment(Waiter.Autopilot, Ref, NodeOffset);
+			if (!Segment)
+			{
+				continue;
+			}
+			Claimed.Add(Segment);
+			FReadScopeLock Lock(Segment->mPathBlocksLock);
+			const TArray<FVehiclePathBlock>& Blocks = Segment->GetVehiclePathBlocks();
+			if (Blocks.IsValidIndex(Ref.PathBlockIndex))
+			{
+				for (const FVehiclePathBlockReference& Over : Blocks[Ref.PathBlockIndex].OverlappingBlocks)
+				{
+					if (IsValid(Over.Segment))
+					{
+						Claimed.Add(Over.Segment);
+					}
+				}
+			}
+		}
+		bool bTaken = false;
+		for (const AFGVehiclePathSegment* Segment : Claimed)
+		{
+			if (GPriority.Contains(Segment))
+			{
+				bTaken = true;
+				break;
+			}
+		}
+		if (bTaken || Claimed.Num() == 0)
+		{
+			continue;
+		}
+		for (const AFGVehiclePathSegment* Segment : Claimed)
+		{
+			GPriority.Add(Segment, Waiter.Autopilot);
+		}
+		Holding.Add(Waiter.Autopilot);
+		if (!GPriorityLogged.Contains(Waiter.Autopilot))
+		{
+			UE_LOG(LogBetterJunctions, Display, TEXT("%s: priority at its junction after %.0f s of waiting, %d segment(s) claimed"),
+				*VehicleLabel(Waiter.Autopilot), Waiter.Seconds, Claimed.Num());
+		}
+	}
+	GPriorityLogged = MoveTemp(Holding);
 }
 
 int32 FBetterJunctionsHooks::ReleaseStandingReservations(UWorld* World, FOutputDevice* Ar)
@@ -502,6 +675,10 @@ void FBetterJunctionsHooks::DumpVehicles(UWorld* World, FOutputDevice* Ar)
 		if (const FStandingState* State = GStanding.Find(Autopilot); State && State->StandingSeconds > 0.0f)
 		{
 			Standing = FString::Printf(TEXT(", standing behind standing %.0f s%s"), State->StandingSeconds, State->bReleasedThisEpisode ? TEXT(" (released)") : TEXT(""));
+		}
+		if (GPriorityLogged.Contains(Autopilot))
+		{
+			Standing += TEXT(", HAS PRIORITY");
 		}
 		Say(Ar, FString::Printf(TEXT("  %s: status %d, speed %.0f, on %s, waited %.0f s on block, reservations %d {%s }, stop target: %s%s"),
 			*VehicleLabel(Vehicle), (int32)Id->GetAutopilotErrorStatus(), Autopilot->GetCurrentForwardSpeed(),
