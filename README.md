@@ -15,11 +15,6 @@ second truck never lets go: it is waiting for a *vehicle*, not for a *block*, an
 120-second deadlock timer (`mAutopilotWaitTimeToDeadlock`) only counts the latter. Every other
 lane of the crossing then queues behind one of the two.
 
-Measured on 12.09.2026: 29 trucks, four lanes, one reservation
-(`Build_VehiclePath_Universal_C_2147435657`, block #1) held by the truck standing second in line.
-Releasing that reservation (toggle its autopilot off and on) drained three lanes within three
-seconds and the fourth as soon as the first one emptied.
-
 ## What the mod does
 
 Two SML hooks, both on the authority only. The pre-hook carries three rules; the last two were
@@ -84,23 +79,3 @@ Both methods are protected; access goes through friend access transformers
 - `Log LogBetterJunctions Verbose` — log every trimmed booking list with the rule that trimmed it.
 
 Command output goes to the console it was typed in and to the log.
-
-## Building
-
-Same rules as any C++ mod: the editor must be closed. The first packaging of a new mod fails
-during cook (no `UnrealEditor-BetterJunctions.dll`, alpakit passes `-nocompileeditor`): build the
-`FactoryEditor` target once, then package with Alpakit as usual. Only Windows (EGS and Steam
-clients) and WindowsServer targets are built.
-
-## Verifying
-
-The gridlock is hard to reproduce, so verify the other way round. `BJ.Dump` on a live server
-should never show a truck with `reservations > 0`, `speed 0` and a stop target of
-`vehicle … at 0 cm/s` for longer than five seconds. Every such release is logged under
-`LogBetterJunctions` with the truck's name, and so is every priority grant
-(`priority at its junction after N s of waiting, M segment(s) claimed`).
-
-Not to be confused with another kind of stop: a truck whose route has only one station (this
-happens after a station is rebuilt, the game removes it from every route) stops where it stands
-with the `TooFewStations` status and blocks the lane. That is not a junction problem and not this
-mod; give the truck its second station back.
