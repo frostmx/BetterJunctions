@@ -128,6 +128,20 @@ namespace
 			Say(Ar, FString::Printf(TEXT("BJ.Unstick: released reservations of %d truck(s)"), Released));
 		}));
 
+	FAutoConsoleCommandWithWorldArgsAndOutputDevice GAutopilotCommand(
+		TEXT("BJ.Autopilot"),
+		TEXT("BetterJunctions: BJ.Autopilot off|on [filter] switches autopilot for every truck at once (filter: substring of the vehicle name)."),
+		FConsoleCommandWithWorldArgsAndOutputDeviceDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World, FOutputDevice& Ar)
+		{
+			bool bEnable = false;
+			if (Args.Num() == 0 || !FBetterJunctionsHooks::ParseAutopilotMode(Args[0], bEnable))
+			{
+				Say(Ar, TEXT("usage: BJ.Autopilot off|on [filter]"));
+				return;
+			}
+			Say(Ar, FBetterJunctionsHooks::SetAutopilotForAll(World, bEnable, Args.Num() > 1 ? Args[1] : FString(), &Ar));
+		}));
+
 	FAutoConsoleCommandWithWorldArgsAndOutputDevice GBlocksCommand(
 		TEXT("BJ.Blocks"),
 		TEXT("BetterJunctions: list every path block reservation held by the segments, with owners and ghosts. Optional argument filters by segment name."),
@@ -634,6 +648,55 @@ int32 FBetterJunctionsHooks::ReleaseStandingReservations(UWorld* World, FOutputD
 		}
 	}
 	return Released;
+}
+
+FString FBetterJunctionsHooks::SetAutopilotForAll(UWorld* World, bool bEnable, const FString& Filter, FOutputDevice* Ar)
+{
+	const TCHAR* Mode = bEnable ? TEXT("on") : TEXT("off");
+	AFGVehicleSubsystem* Subsystem = AFGVehicleSubsystem::Get(World);
+	if (!IsValid(Subsystem))
+	{
+		return FString::Printf(TEXT("BJ.Autopilot %s: no vehicle subsystem"), Mode);
+	}
+	if (Subsystem->GetNetMode() == NM_Client)
+	{
+		// SetAutopilotEnabled is not a server RPC: on a client it would flip the local copy only.
+		return FString::Printf(TEXT("BJ.Autopilot %s: only on the server or the host"), Mode);
+	}
+	int32 Changed = 0, Unchanged = 0, Skipped = 0;
+	for (AFGWheeledVehicleIdentifier* Id : Subsystem->GetAllVehicles())
+	{
+		if (!IsValid(Id) || (!Filter.IsEmpty() && !Id->GetVehicleName().ToString().Contains(Filter)))
+		{
+			continue;
+		}
+		if (Id->IsAutopilotEnabled() == bEnable)
+		{
+			++Unchanged;
+			continue;
+		}
+		const FString Label = VehicleLabel(Id->GetOwnerVehicle());
+		if (bEnable && !Id->CanEnableAutopilot())
+		{
+			// A route with fewer than two stations; the game would refuse the same way from the UI.
+			Say(Ar, FString::Printf(TEXT("BJ.Autopilot on: cannot enable %s"), *Label));
+			++Skipped;
+			continue;
+		}
+		Id->SetAutopilotEnabled(bEnable);
+		Say(Ar, FString::Printf(TEXT("BJ.Autopilot %s: %s"), Mode, *Label));
+		++Changed;
+	}
+	FString Summary = FString::Printf(TEXT("BJ.Autopilot %s: changed %d, unchanged %d"), Mode, Changed, Unchanged);
+	if (Skipped > 0)
+	{
+		Summary += FString::Printf(TEXT(", cannot enable %d"), Skipped);
+	}
+	if (!Filter.IsEmpty())
+	{
+		Summary += FString::Printf(TEXT(" (filter '%s')"), *Filter);
+	}
+	return Summary;
 }
 
 void FBetterJunctionsHooks::DumpVehicles(UWorld* World, FOutputDevice* Ar)

@@ -76,6 +76,18 @@ Both methods are protected; access goes through friend access transformers
   cannot see them): exclusive ones with their owner, shared ones with the exclusive they belong
   to, and a GHOST mark on those nobody references any more.
 - `BJ.Purge` — release every ghost reservation found by the same walk.
+- `BJ.Autopilot off|on [filter]` — switch autopilot for every truck at once; the filter is a
+  substring of the vehicle name. `off` also drops every path block reservation, so `off` then
+  `on` is the crudest unstick there is. `on` skips trucks whose route is too short, and every
+  truck books its path anew in the same tick, so busy crossings take a moment to sort out.
 - `Log LogBetterJunctions Verbose` — log every trimmed booking list with the rule that trimmed it.
 
 Command output goes to the console it was typed in and to the log.
+
+## Chat command
+
+`/autopilot off|on [filter]` does the same as `BJ.Autopilot` from the in-game chat of any
+player. SML intercepts a chat line starting with `/` on the client and sends it to the server
+through its own remote call object, so this works from a client of a dedicated server, and the
+client needs only SML, not this mod. The one-line summary comes back in the chat; the per-truck
+lines go to the server log only.

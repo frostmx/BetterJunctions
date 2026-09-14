@@ -27,6 +27,21 @@ public:
 	static int32 ReleaseStandingReservations(UWorld* World, FOutputDevice* Ar = nullptr);
 
 	/**
+	 * Switches autopilot off or on for every truck whose name contains Filter (empty: all).
+	 * Per-truck lines go to Ar; the one-line summary is returned for the caller to print,
+	 * because the console and the chat command report it differently. BJ.Autopilot, /autopilot
+	 */
+	static FString SetAutopilotForAll(UWorld* World, bool bEnable, const FString& Filter, FOutputDevice* Ar = nullptr);
+
+	/** "off" / "on" (any case) into a flag; false for anything else. Shared by the console and the chat command. */
+	static bool ParseAutopilotMode(const FString& Word, bool& bOutEnable)
+	{
+		if (Word.Equals(TEXT("on"), ESearchCase::IgnoreCase)) { bOutEnable = true; return true; }
+		if (Word.Equals(TEXT("off"), ESearchCase::IgnoreCase)) { bOutEnable = false; return true; }
+		return false;
+	}
+
+	/**
 	 * Lists every exclusive and shared reservation held in the segments' own block arrays, with
 	 * its owner and whether the owner still references it. Reflection cannot see these arrays;
 	 * a reservation nobody references is a ghost and blocks the junction forever. BJ.Blocks [filter]
