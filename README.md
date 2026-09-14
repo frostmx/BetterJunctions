@@ -33,14 +33,14 @@ added after the first build met two further kinds of jam on a dedicated server.
     dropped, and the truck waits at the entrance. The game only checks that the exit block can be
     booked, not that it is free of a queue, so a queue backing up through a junction left trucks
     standing inside it, holding its blocks, and the heads of two queues Deadlocked on blocks that
-    overlapped those (measured 12.09.2026 on a dedicated server). A truck already inside a
+    overlapped those. A truck already inside a
     junction is never held back: it has to leave.
 
   - *junction priority*: a truck that has waited ten seconds on a junction claims it, and nobody
     else books that junction (or any segment overlapping its blocks) until the waiter is in.
     Booking needs every block of the sequence free at the moment of the attempt, and a crossing
     with steady traffic never has that moment for a truck that needs more of it than the passing
-    ones do: measured 12.09.2026, a truck waited twelve minutes at a crossing with a different
+    ones do, a truck waited twelve minutes at a crossing with a different
     fuel truck inside it at every look, while the queue behind it backed up through two other
     junctions. Longest wait wins; a waiter whose junction is already claimed by a longer one
     stays out, so two trucks on crossing paths never hold each other back; a truck already
