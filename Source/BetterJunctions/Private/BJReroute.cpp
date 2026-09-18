@@ -138,6 +138,94 @@ namespace
 		}));
 }
 
+/**
+ * What every truck of one pass shares. Built lazily: a pass in which no truck has a jam ahead
+ * and none waits at a junction builds nothing at all. Before this each truck rebuilt the
+ * segment table (some 1650 actors) and its network's adjacency on every pass, jam or not.
+ */
+struct FBJReroutePass
+{
+	struct FNetwork
+	{
+		/** Segment actor per index of the network's segment data. */
+		TArray<AFGVehiclePathSegment*> Actors;
+		/** Traversable segments leaving each node, per vehicle type. */
+		TMap<const UFGVehiclePathPreset*, TArray<TArray<int32>>> Leaving;
+	};
+
+	/** AllSegments is the subsystem's protected segment set, handed over by the friend hooks class. */
+	explicit FBJReroutePass(const TSet<TObjectPtr<AFGVehiclePathSegment>>& InAllSegments) : AllSegments(InAllSegments) {}
+
+	AFGVehiclePathSegment* FindSegment(const FGuid& From, const FGuid& To)
+	{
+		if (!bSegmentsBuilt)
+		{
+			bSegmentsBuilt = true;
+			for (AFGVehiclePathSegment* Segment : AllSegments)
+			{
+				if (IsValid(Segment))
+				{
+					SegmentByNodes.Add({Segment->GetStartPathNodeGuid(), EndGuid(Segment)}, Segment);
+				}
+			}
+		}
+		AFGVehiclePathSegment* const* Found = SegmentByNodes.Find({From, To});
+		return Found ? *Found : nullptr;
+	}
+
+	const TArray<AFGVehiclePathSegment*>& Actors(const UFGVehiclePathNetwork* Network)
+	{
+		return Get(Network).Actors;
+	}
+
+	const TArray<TArray<int32>>& Leaving(const UFGVehiclePathNetwork* Network, const UFGVehiclePathPreset* Preset)
+	{
+		FNetwork& Entry = Get(Network);
+		if (const TArray<TArray<int32>>* Found = Entry.Leaving.Find(Preset))
+		{
+			return *Found;
+		}
+		const TArray<FVehiclePathNetworkNodeData>& Nodes = Network->GetPathNodes();
+		const TArray<FVehiclePathNetworkSegmentData>& Data = Network->GetPathSegments();
+		TArray<TArray<int32>>& Out = Entry.Leaving.Add(Preset);
+		Out.SetNum(Nodes.Num());
+		for (int32 Index = 0; Index < Data.Num(); ++Index)
+		{
+			if (Nodes.IsValidIndex(Data[Index].FromNodeIndex) && Nodes.IsValidIndex(Data[Index].ToNodeIndex) && Network->CanVehicleTraverseSegment(Data[Index], Preset))
+			{
+				Out[Data[Index].FromNodeIndex].Add(Index);
+			}
+		}
+		return Out;
+	}
+
+private:
+	FNetwork& Get(const UFGVehiclePathNetwork* Network)
+	{
+		if (FNetwork* Found = Networks.Find(Network))
+		{
+			return *Found;
+		}
+		FNetwork& Entry = Networks.Add(Network);
+		const TArray<FVehiclePathNetworkNodeData>& Nodes = Network->GetPathNodes();
+		const TArray<FVehiclePathNetworkSegmentData>& Data = Network->GetPathSegments();
+		Entry.Actors.SetNumZeroed(Data.Num());
+		for (int32 Index = 0; Index < Data.Num(); ++Index)
+		{
+			if (Nodes.IsValidIndex(Data[Index].FromNodeIndex) && Nodes.IsValidIndex(Data[Index].ToNodeIndex))
+			{
+				Entry.Actors[Index] = FindSegment(Nodes[Data[Index].FromNodeIndex].PathNodeGuid, Nodes[Data[Index].ToNodeIndex].PathNodeGuid);
+			}
+		}
+		return Entry;
+	}
+
+	const TSet<TObjectPtr<AFGVehiclePathSegment>>& AllSegments;
+	bool bSegmentsBuilt = false;
+	TMap<TPair<FGuid, FGuid>, AFGVehiclePathSegment*> SegmentByNodes;
+	TMap<const UFGVehiclePathNetwork*, FNetwork> Networks;
+};
+
 void FBetterJunctionsHooks::BuildJamPenalties(AFGVehicleSubsystem* Subsystem, TMap<const AFGVehiclePathSegment*, float>& OutPenalties)
 {
 	OutPenalties.Reset();
@@ -189,8 +277,8 @@ void FBetterJunctionsHooks::BuildJamPenalties(AFGVehicleSubsystem* Subsystem, TM
 	}
 }
 
-bool FBetterJunctionsHooks::TryReroute(AFGVehicleSubsystem* Subsystem, UFGVehicleAutopilotComponent* Autopilot, TMap<const AFGVehiclePathSegment*, float>& Penalties,
-	bool bApply, bool bAvoid, bool bVerbose, FOutputDevice* Ar)
+bool FBetterJunctionsHooks::TryReroute(FBJReroutePass& Pass, AFGVehicleSubsystem* Subsystem, UFGVehicleAutopilotComponent* Autopilot,
+	TMap<const AFGVehiclePathSegment*, float>& Penalties, bool bApply, bool bAvoid, bool bVerbose, FOutputDevice* Ar)
 {
 	const auto Skip = [&](const FString& Why)
 	{
@@ -285,6 +373,17 @@ bool FBetterJunctionsHooks::TryReroute(AFGVehicleSubsystem* Subsystem, UFGVehicl
 	}
 	const TMap<const AFGVehiclePathSegment*, float>& Prices = bAvoid ? Avoided : Penalties;
 
+	// The cheap test first: nothing to do for a truck with no jam on the rest of its way.
+	bool bJamAhead = false;
+	for (int32 Index = Branch + 1; Index < Route.Num() && !bJamAhead; ++Index)
+	{
+		bJamAhead = Prices.Contains(Segments[Index].Get());
+	}
+	if (!bJamAhead && !bWaiter)
+	{
+		return Skip(TEXT("no standing vehicle ahead"));
+	}
+
 	UFGVehiclePathNetwork* Network = Subsystem->FindNetworkByID(Autopilot->mCurrentPathNetworkID);
 	if (!Network)
 	{
@@ -298,33 +397,18 @@ bool FBetterJunctionsHooks::TryReroute(AFGVehicleSubsystem* Subsystem, UFGVehicl
 	{
 		return Skip(TEXT("route nodes not in the network"));
 	}
-
-	// Segment actors by their end nodes, for the penalties and for the new route's segment array.
-	TMap<TPair<FGuid, FGuid>, AFGVehiclePathSegment*> SegmentByNodes;
-	for (AFGVehiclePathSegment* Segment : Subsystem->mAllPathSegments)
-	{
-		if (IsValid(Segment))
-		{
-			SegmentByNodes.Add({Segment->GetStartPathNodeGuid(), EndGuid(Segment)}, Segment);
-		}
-	}
-	const auto ActorOf = [&](int32 SegmentIndex) -> const AFGVehiclePathSegment*
-	{
-		const FVehiclePathNetworkSegmentData& Data = SegmentData[SegmentIndex];
-		AFGVehiclePathSegment* const* Actor = SegmentByNodes.Find({Nodes[Data.FromNodeIndex].PathNodeGuid, Nodes[Data.ToNodeIndex].PathNodeGuid});
-		return Actor ? *Actor : nullptr;
-	};
+	const UFGVehiclePathPreset* Preset = Vehicle->GetVehiclePathPreset();
+	const TArray<TArray<int32>>& Leaving = Pass.Leaving(Network, Preset);
+	const TArray<AFGVehiclePathSegment*>& Actors = Pass.Actors(Network);
 	const auto Cost = [&](int32 SegmentIndex)
 	{
-		const AFGVehiclePathSegment* Actor = ActorOf(SegmentIndex);
-		const float* Penalty = Actor ? Prices.Find(Actor) : nullptr;
+		const float* Penalty = Actors[SegmentIndex] ? Prices.Find(Actors[SegmentIndex]) : nullptr;
 		return SegmentData[SegmentIndex].SegmentLength + (Penalty ? *Penalty : 0.0f);
 	};
 
 	// The rest of the current leg at today's prices.
 	float CurrentCost = 0.0f;
 	float CurrentLength = 0.0f;
-	bool bJamAhead = false;
 	for (int32 Index = Branch + 1; Index < Route.Num(); ++Index)
 	{
 		const int32 SegmentIndex = Network->FindPathIndexBetweenPathNodes(Network->FindPathNodeIndexByGuid(Route[Index - 1]), Network->FindPathNodeIndexByGuid(Route[Index]));
@@ -334,25 +418,9 @@ bool FBetterJunctionsHooks::TryReroute(AFGVehicleSubsystem* Subsystem, UFGVehicl
 		}
 		CurrentCost += Cost(SegmentIndex);
 		CurrentLength += SegmentData[SegmentIndex].SegmentLength;
-		bJamAhead |= Prices.Contains(Segments[Index].Get());
-	}
-	if (!bJamAhead && !bWaiter)
-	{
-		return Skip(TEXT("no standing vehicle ahead"));
 	}
 
 	// Dijkstra over the same network with the same traversability rule as the game.
-	const UFGVehiclePathPreset* Preset = Vehicle->GetVehiclePathPreset();
-	TArray<TArray<int32>> Leaving;
-	Leaving.SetNum(Nodes.Num());
-	for (int32 SegmentIndex = 0; SegmentIndex < SegmentData.Num(); ++SegmentIndex)
-	{
-		const FVehiclePathNetworkSegmentData& Data = SegmentData[SegmentIndex];
-		if (Nodes.IsValidIndex(Data.FromNodeIndex) && Nodes.IsValidIndex(Data.ToNodeIndex) && Network->CanVehicleTraverseSegment(Data, Preset))
-		{
-			Leaving[Data.FromNodeIndex].Add(SegmentIndex);
-		}
-	}
 	TArray<float> Distance;
 	Distance.Init(TNumericLimits<float>::Max(), Nodes.Num());
 	TArray<int32> Via;
@@ -380,7 +448,7 @@ bool FBetterJunctionsHooks::TryReroute(AFGVehicleSubsystem* Subsystem, UFGVehicl
 		}
 		for (const int32 SegmentIndex : Leaving[Top.Node])
 		{
-			if (Banned.Num() > 0 && Banned.Contains(ActorOf(SegmentIndex)))
+			if (Banned.Num() > 0 && Banned.Contains(Actors[SegmentIndex]))
 			{
 				continue;
 			}
@@ -411,12 +479,12 @@ bool FBetterJunctionsHooks::TryReroute(AFGVehicleSubsystem* Subsystem, UFGVehicl
 	FGuid Previous = Route[Branch];
 	for (const FGuid& Node : Tail)
 	{
-		AFGVehiclePathSegment* const* Actor = SegmentByNodes.Find({Previous, Node});
+		AFGVehiclePathSegment* Actor = Pass.FindSegment(Previous, Node);
 		if (!Actor)
 		{
 			return Skip(TEXT("no segment actor on the new path"));
 		}
-		TailSegments.Add(*Actor);
+		TailSegments.Add(Actor);
 		Previous = Node;
 	}
 
@@ -505,6 +573,7 @@ int32 FBetterJunctionsHooks::RerouteVehicles(UWorld* World, const FString& Filte
 	TMap<const AFGVehiclePathSegment*, float> Penalties;
 	BuildJamPenalties(Subsystem, Penalties);
 	RSay(Ar, FString::Printf(TEXT("BJ.Reroute: %d segment(s) with standing vehicles"), Penalties.Num()));
+	FBJReroutePass Pass(Subsystem->mAllPathSegments);
 	int32 Rerouted = 0;
 	for (AFGWheeledVehicleIdentifier* Id : Subsystem->GetAllVehicles())
 	{
@@ -514,7 +583,7 @@ int32 FBetterJunctionsHooks::RerouteVehicles(UWorld* World, const FString& Filte
 		}
 		const AFGWheeledVehicle* Vehicle = Id->GetOwnerVehicle();
 		UFGVehicleAutopilotComponent* Autopilot = IsValid(Vehicle) ? Vehicle->GetVehicleAutopilotComponent() : nullptr;
-		if (IsValid(Autopilot) && TryReroute(Subsystem, Autopilot, Penalties, bApply, bAvoid, true, Ar))
+		if (IsValid(Autopilot) && TryReroute(Pass, Subsystem, Autopilot, Penalties, bApply, bAvoid, true, Ar))
 		{
 			++Rerouted;
 		}
@@ -546,13 +615,14 @@ void FBetterJunctionsHooks::TickReroute(AFGVehicleSubsystem* Subsystem, float De
 			It.RemoveCurrent();
 		}
 	}
+	FBJReroutePass Pass(Subsystem->mAllPathSegments);
 	for (AFGWheeledVehicleIdentifier* Id : Subsystem->GetAllVehicles())
 	{
 		const AFGWheeledVehicle* Vehicle = IsValid(Id) && Id->IsAutopilotEnabled() ? Id->GetOwnerVehicle() : nullptr;
 		UFGVehicleAutopilotComponent* Autopilot = IsValid(Vehicle) ? Vehicle->GetVehicleAutopilotComponent() : nullptr;
 		if (IsValid(Autopilot) && !GLastReroute.Contains(Autopilot))
 		{
-			TryReroute(Subsystem, Autopilot, Penalties, true, false, false, nullptr);
+			TryReroute(Pass, Subsystem, Autopilot, Penalties, true, false, false, nullptr);
 		}
 	}
 }

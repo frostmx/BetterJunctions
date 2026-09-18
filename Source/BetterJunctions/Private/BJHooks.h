@@ -68,8 +68,8 @@ private:
 	 * Returns true if the truck was rerouted. Penalties maps a segment to its extra cost in cm and
 	 * gets the new path's herding penalty added when a truck is rerouted.
 	 */
-	static bool TryReroute(AFGVehicleSubsystem* Subsystem, UFGVehicleAutopilotComponent* Autopilot, TMap<const class AFGVehiclePathSegment*, float>& Penalties,
-		bool bApply, bool bAvoid, bool bVerbose, FOutputDevice* Ar);
+	static bool TryReroute(struct FBJReroutePass& Pass, AFGVehicleSubsystem* Subsystem, UFGVehicleAutopilotComponent* Autopilot,
+		TMap<const class AFGVehiclePathSegment*, float>& Penalties, bool bApply, bool bAvoid, bool bVerbose, FOutputDevice* Ar);
 
 	/**
 	 * True if nobody but Self holds or blocks the segment's blocks (all of them, or only the first):
