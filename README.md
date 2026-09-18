@@ -76,16 +76,15 @@ switches a truck to another road when that pays off:
   in the same pass, so a column does not follow blindly;
 - *waiting at a junction*: a truck that has waited 5 s for its junction blocks may leave by another
   exit, but only if every block of that way through the junction is free this very moment and the
-  detour is no longer than 6 m for every second waited (20 m at least). Measured with rerouting
-  off (18.09.2026, 51 trucks, 376 waits): a truck that has waited t seconds waits about 0.6 t
-  more, so at ~10 m/s that is the break-even detour. A flat allowance sent trucks that had waited
-  6 s on 250 m detours.
+  detour is no longer than 6 m for every second waited (20 m at least). With rerouting off, a
+  truck that has waited t seconds waits about 0.6 t more, so at ~10 m/s that is the break-even
+  detour. A flat allowance sent trucks that had waited 6 s on 250 m detours.
 
 Only the tail of the route is replaced, from the end of the last segment the truck holds a
 reservation on: nothing booked is ever given up, so a truck inside a junction or braking into one
 keeps its way through. The station list is not touched.
 
-Recon on the author's save: for a 100 m queue a detour no longer than 1.5x exists on about half
+On one real save, for a 100 m queue a detour no longer than 1.5x exists on about half
 of the road the trucks drive; a quarter of the legs have none. On a calm save an A/B run of 15
 minutes each gave 295 arrivals at stations with rerouting on against 294 with it off: no harm,
 and no gain where there are no jams.
