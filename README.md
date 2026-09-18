@@ -63,11 +63,11 @@ Both methods are protected; access goes through friend access transformers
 (`Config/AccessTransformers.ini`), which is why every build of this mod recompiles all of
 `FactoryGame`.
 
-## Rerouting (experimental, off by default)
+## Rerouting (experimental, on by default)
 
 The game plans a truck's way to its next station once, with A* over the road network and a static
 cost per segment, and keeps it until the station is reached. Nothing in that cost knows about a
-queue. With `BJ.Reroute.Auto 1` the mod replans the rest of the current leg every two seconds and
+queue. With `BJ.Reroute.Auto 1`, the default since 1.0.4, the mod replans the rest of the current leg every two seconds and
 switches a truck to another road when that pays off:
 
 - *jam ahead*: a vehicle that has stood on a segment for 10 s or more adds 150 m to that segment's
@@ -111,7 +111,9 @@ and no gain where there are no jams.
   filter): the rest of its leg against the best way around standing vehicles, with the verdict.
   `apply` switches the trucks for which it pays off; `avoid` is a test aid that prices the next
   three segments of each truck's way as jammed.
-- `BJ.Reroute.Auto 0|1` — rerouting on its own, see above. Off by default.
+- `BJ.Reroute.Auto 0|1` — rerouting on its own, see above. On by default; `0` turns it off until
+  the server restarts, `BJ.Reroute.Auto=0` under `[SystemSettings]` in the server's `Engine.ini`
+  for good.
 - `Log LogBetterJunctions Verbose` — log every trimmed booking list with the rule that trimmed it.
 
 Command output goes to the console it was typed in and to the log.

@@ -75,10 +75,11 @@ namespace
 	constexpr int32 AvoidSegments = 3;
 	constexpr float AvoidPenalty = 1000000.0f;
 
+	/** On by default since 1.0.4 (the owner's call): an A/B run on a calm save showed no harm. */
 	TAutoConsoleVariable<int32> CVarRerouteAuto(
 		TEXT("BJ.Reroute.Auto"),
-		0,
-		TEXT("BetterJunctions: 1 = trucks with standing vehicles ahead on their way switch to a cheaper path on their own. 0 = only BJ.Reroute apply does it."));
+		1,
+		TEXT("BetterJunctions: 1 (default) = trucks with standing vehicles ahead on their way, or waiting at a junction, switch to a cheaper path on their own. 0 = only BJ.Reroute apply does it."));
 
 	float GSincePass = 0.0f;
 	/** World time each vehicle was first seen standing on the road. Game thread only. */
