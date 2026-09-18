@@ -63,6 +63,33 @@ Both methods are protected; access goes through friend access transformers
 (`Config/AccessTransformers.ini`), which is why every build of this mod recompiles all of
 `FactoryGame`.
 
+## Rerouting (experimental, off by default)
+
+The game plans a truck's way to its next station once, with A* over the road network and a static
+cost per segment, and keeps it until the station is reached. Nothing in that cost knows about a
+queue. With `BJ.Reroute.Auto 1` the mod replans the rest of the current leg every two seconds and
+switches a truck to another road when that pays off:
+
+- *jam ahead*: a vehicle that has stood on a segment for 10 s or more adds 150 m to that segment's
+  cost. A truck switches when the new way is cheaper by 20% and by 50 m at least, and is not
+  rerouted again for 30 s. Each truck sent onto a road makes it a little dearer for the next one
+  in the same pass, so a column does not follow blindly;
+- *waiting at a junction*: a truck that has waited 5 s for its junction blocks may leave by another
+  exit, but only if every block of that way through the junction is free this very moment and the
+  detour is no longer than 6 m for every second waited (20 m at least). Measured with rerouting
+  off (18.09.2026, 51 trucks, 376 waits): a truck that has waited t seconds waits about 0.6 t
+  more, so at ~10 m/s that is the break-even detour. A flat allowance sent trucks that had waited
+  6 s on 250 m detours.
+
+Only the tail of the route is replaced, from the end of the last segment the truck holds a
+reservation on: nothing booked is ever given up, so a truck inside a junction or braking into one
+keeps its way through. The station list is not touched.
+
+Recon on the author's save: for a 100 m queue a detour no longer than 1.5x exists on about half
+of the road the trucks drive; a quarter of the legs have none. On a calm save an A/B run of 15
+minutes each gave 295 arrivals at stations with rerouting on against 294 with it off: no harm,
+and no gain where there are no jams.
+
 ## Console commands
 
 - `BJ.Dump` — every truck on autopilot: status, speed, time waited on a block, number of
@@ -80,6 +107,11 @@ Both methods are protected; access goes through friend access transformers
   substring of the vehicle name. `off` also drops every path block reservation, so `off` then
   `on` is the crudest unstick there is. `on` skips trucks whose route is too short, and every
   truck books its path anew in the same tick, so busy crossings take a moment to sort out.
+- `BJ.Reroute [filter] [apply] [avoid]` — for every truck (or those whose name contains the
+  filter): the rest of its leg against the best way around standing vehicles, with the verdict.
+  `apply` switches the trucks for which it pays off; `avoid` is a test aid that prices the next
+  three segments of each truck's way as jammed.
+- `BJ.Reroute.Auto 0|1` — rerouting on its own, see above. Off by default.
 - `Log LogBetterJunctions Verbose` — log every trimmed booking list with the rule that trimmed it.
 
 Command output goes to the console it was typed in and to the log.

@@ -51,7 +51,36 @@ public:
 	/** Releases every ghost reservation found by the same walk. BJ.Purge */
 	static int32 PurgeGhostReservations(UWorld* World, FOutputDevice* Ar = nullptr);
 
+	/**
+	 * For every autopilot truck whose name contains Filter: the rest of its current leg against
+	 * the best path around standing vehicles, and with bApply the switch to it where it pays off.
+	 * With bAvoid (a test aid) the next few segments of each truck's path are priced as jammed.
+	 * Returns the number of trucks rerouted. BJ.Reroute [filter] [apply] [avoid]
+	 */
+	static int32 RerouteVehicles(UWorld* World, const FString& Filter, bool bApply, bool bAvoid, FOutputDevice* Ar = nullptr);
+
 private:
+	/** Rerouting: every few seconds, trucks with a jam ahead switch to a cheaper path when BJ.Reroute.Auto is set. Game thread, post-tick. */
+	static void TickReroute(AFGVehicleSubsystem* Subsystem, float DeltaTime);
+
+	/**
+	 * Replans the tail of one truck's current leg with jam penalties and, with bApply, swaps it in.
+	 * Returns true if the truck was rerouted. Penalties maps a segment to its extra cost in cm and
+	 * gets the new path's herding penalty added when a truck is rerouted.
+	 */
+	static bool TryReroute(AFGVehicleSubsystem* Subsystem, UFGVehicleAutopilotComponent* Autopilot, TMap<const class AFGVehiclePathSegment*, float>& Penalties,
+		bool bApply, bool bAvoid, bool bVerbose, FOutputDevice* Ar);
+
+	/**
+	 * True if nobody but Self holds or blocks the segment's blocks (all of them, or only the first):
+	 * no reservations of others on them, no exclusives of others on blocks overlapping them, and
+	 * (for the whole segment) no other vehicle inside.
+	 */
+	static bool IsSegmentFreeFor(const class AFGVehiclePathSegment* Segment, const class AFGWheeledVehicle* Self, bool bFirstBlockOnly);
+
+	/** Extra cost of each segment: vehicles that have stood on it long enough. Also keeps the standing timers. */
+	static void BuildJamPenalties(AFGVehicleSubsystem* Subsystem, TMap<const class AFGVehiclePathSegment*, float>& OutPenalties);
+
 	/**
 	 * Pre-hook of the booking call: drops every block that lies beyond a standing truck ahead,
 	 * and the entry into any junction the truck could not leave because a slow or standing truck

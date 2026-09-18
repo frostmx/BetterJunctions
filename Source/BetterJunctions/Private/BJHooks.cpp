@@ -523,6 +523,7 @@ void FBetterJunctionsHooks::TickWatchdog(AFGVehicleSubsystem* Subsystem, float D
 	}
 
 	RebuildPriority(Subsystem);
+	TickReroute(Subsystem, DeltaTime);
 
 	GSinceSweep += DeltaTime;
 	if (GSinceSweep >= WatchdogSweepSeconds)
