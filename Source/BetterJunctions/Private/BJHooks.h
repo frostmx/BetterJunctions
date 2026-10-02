@@ -83,8 +83,9 @@ private:
 
 	/**
 	 * Pre-hook of the booking call: drops every block that lies beyond a standing truck ahead,
-	 * and the entry into any junction the truck could not leave because a slow or standing truck
-	 * ahead leaves no room past the exit. Returns false when nothing has to change, true with the
+	 * the entry into any junction the truck could not leave because a queue ahead (a slow truck
+	 * past the exit, or a standing one) leaves no room past the exit, and the entry into a junction
+	 * whose blocks another truck has claimed. Returns false when nothing has to change, true with the
 	 * filtered list in OutKept otherwise. The booking call also fills the set of blocks the game
 	 * keeps, so blocks dropped here are released by the game's own cleanup.
 	 */

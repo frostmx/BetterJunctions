@@ -28,16 +28,23 @@ added after the first build met two further kinds of jam on a dedicated server.
     surplus reservations, so blocks already held beyond the leader are released in the same tick.
     A moving leader is deliberately left alone;
   - *junction entry*: a truck does not book its way into a junction unless it can leave it. If a
-    slow vehicle ahead (slower than 3 m/s) leaves less room than the distance to the junction's
-    exit plus the truck's own length plus 2 m, the junction blocks and everything after them are
-    dropped, and the truck waits at the entrance. The game only checks that the exit block can be
+    queue ahead leaves less room than the distance to the junction's exit plus the truck's own
+    length plus 2 m, the junction blocks and everything after them are dropped, and the truck
+    waits at the entrance. A queue is a vehicle past the exit slower than 3 m/s, or a standing
+    one anywhere; a vehicle still inside the junction and moving is clearing it and does not
+    count, since every truck creeps at 2.5 m/s towards a stop line or a dock and counting those
+    held trucks at the entrance behind leaders that were only turning. The game only checks that the exit block can be
     booked, not that it is free of a queue, so a queue backing up through a junction left trucks
     standing inside it, holding its blocks, and the heads of two queues Deadlocked on blocks that
     overlapped those. A truck already inside a
     junction is never held back: it has to leave.
 
-  - *junction priority*: a truck that has waited ten seconds on a junction claims it, and nobody
-    else books that junction (or any segment overlapping its blocks) until the waiter is in.
+  - *junction priority*: a truck that has waited ten seconds on a junction claims the junction
+    blocks it waits for, and nobody else books those blocks, or any block overlapping them, until
+    the waiter is in; a truck that meets a claimed block gives up the whole junction from its
+    entry, so it never stops halfway inside. The block past the exit is not claimed: claiming
+    whole segments took the road past the junction too, and trucks that had just left the
+    junction braked on an empty road.
     Booking needs every block of the sequence free at the moment of the attempt, and a crossing
     with steady traffic never has that moment for a truck that needs more of it than the passing
     ones do, a truck waited twelve minutes at a crossing with a different

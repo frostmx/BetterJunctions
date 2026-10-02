@@ -28,9 +28,12 @@ namespace
 	/** Our own speed below this counts as standing. */
 	constexpr float SelfStandingSpeed = 30.0f;
 	/**
-	 * A vehicle ahead slower than this counts as a queue for the junction-entry rule: a truck
-	 * does not enter a junction unless it can leave it past such a vehicle. Faster traffic is
-	 * flowing, and the gap in front of it will have moved on by the time the junction is crossed.
+	 * A vehicle past the junction exit slower than this counts as a queue for the junction-entry
+	 * rule: a truck does not enter a junction unless it can leave it past such a vehicle. Faster
+	 * traffic is flowing, and the gap in front of it will have moved on by the time the junction
+	 * is crossed. A vehicle still inside the junction counts only while standing: one that moves
+	 * is clearing it, and the vanilla approach speed to any stop line or dock is 250, below this,
+	 * so counting it held trucks at the entry behind leaders that were only turning.
 	 */
 	constexpr float SlowLeaderSpeed = 300.0f;
 	/** Extra room required past a junction exit, beyond the truck's own length. */
@@ -67,11 +70,17 @@ namespace
 	float GSinceSweep = 0.0f;
 
 	/**
-	 * Junction segments claimed by a waiting truck, rebuilt after every autopilot tick on the
-	 * game thread and read by the booking filter on the worker threads during the next tick.
-	 * The two never overlap: the post-tick hook runs after the parallel work has been joined.
+	 * Junction blocks claimed by a waiting truck: the junction blocks of the sequence it waits
+	 * for and every block overlapping them. Rebuilt after every autopilot tick on the game thread
+	 * and read by the booking filter on the worker threads during the next tick. The two never
+	 * overlap: the post-tick hook runs after the parallel work has been joined. The segment
+	 * pointer in the key is only compared, never dereferenced.
+	 *
+	 * Blocks, not segments: a sequence ends with a block on the road past the junction, and
+	 * claiming whole segments claimed that road too, so a truck that had just left the junction
+	 * could book nothing past the block it stood on and braked in the middle of an empty road.
 	 */
-	TMap<TWeakObjectPtr<const AFGVehiclePathSegment>, TWeakObjectPtr<const UFGVehicleAutopilotComponent>> GPriority;
+	TMap<FVehiclePathBlockReference, TWeakObjectPtr<const UFGVehicleAutopilotComponent>> GPriority;
 	/** Trucks that hold a priority right now, so the log line comes once per wait. */
 	TSet<TWeakObjectPtr<const UFGVehicleAutopilotComponent>> GPriorityLogged;
 
@@ -209,9 +218,10 @@ bool FBetterJunctionsHooks::FilterBlocksBeyondStandingVehicle(const UFGVehicleAu
 	// left alone here on purpose: the two sort themselves out by speed matching.
 	//
 	// Junction entry: a truck does not book its way into a junction unless it can also leave it,
-	// with a slow or standing vehicle ahead leaving room past the exit for the whole truck. The
-	// game only checks that the exit block can be booked, not that it is free of a queue, so a
-	// queue backing up through a junction leaves trucks standing inside it, holding its blocks.
+	// with a queue ahead (a slow vehicle past the exit, or a standing one anywhere) leaving room
+	// past the exit for the whole truck. The game only checks that the exit block can be booked,
+	// not that it is free of a queue, so a queue backing up through a junction leaves trucks
+	// standing inside it, holding its blocks.
 	// Measured on 12.09.2026 on a dedicated server: two queue heads Deadlocked for minutes on
 	// blocks overlapping the ones held by trucks standing inside the next junction back in the
 	// same queue, and the watchdog could not help, since a truck must keep the block it stands on.
@@ -219,7 +229,13 @@ bool FBetterJunctionsHooks::FilterBlocksBeyondStandingVehicle(const UFGVehicleAu
 	TArray<FVehicleStopTarget> Ahead;
 	Autopilot->CalculateVehicleAvoidanceTarget(AvoidanceLookahead, HalfLength, Ahead);
 	float StandingDistance = TNumericLimits<float>::Max();
-	float SlowDistance = TNumericLimits<float>::Max();
+	/** Distance to the stop point behind a slow vehicle ahead and whether that vehicle stands. */
+	struct FSlowLeader
+	{
+		float Distance;
+		bool bStanding;
+	};
+	TArray<FSlowLeader, TInlineAllocator<4>> SlowLeaders;
 	for (const FVehicleStopTarget& Target : Ahead)
 	{
 		if (!Target.TargetMovementSpeed.IsSet())
@@ -234,13 +250,16 @@ bool FBetterJunctionsHooks::FilterBlocksBeyondStandingVehicle(const UFGVehicleAu
 		}
 		if (Speed < SlowLeaderSpeed)
 		{
-			SlowDistance = FMath::Min(SlowDistance, Distance);
+			SlowLeaders.Add({Distance, Speed < LeaderStandingSpeed});
 		}
 	}
-	if (SlowDistance == TNumericLimits<float>::Max() && GPriority.Num() == 0)
+	if (SlowLeaders.Num() == 0 && GPriority.Num() == 0)
 	{
 		return false;
 	}
+	// The stop target lies the avoidance spacing short of the leader's rear, measured from our
+	// front: adding both back gives where the leader's rear is, from our centre.
+	const float LeaderRearOffset = Autopilot->mAutopilotVehicleAvoidanceSpacing + HalfLength;
 
 	FVehicleAutopilotBlockReference Current;
 	float DistanceToEndOfCurrentBlock = 0.0f;
@@ -260,6 +279,8 @@ bool FBetterJunctionsHooks::FilterBlocksBeyondStandingVehicle(const UFGVehicleAu
 	float Room = 0.0f;
 	// A truck inside a junction has to leave it whatever anyone is waiting for.
 	const bool bInsideJunction = IsJunction(Current);
+	// Index in PathBlocks where the junction being looked at begins (INDEX_NONE outside one).
+	int32 JunctionStart = INDEX_NONE;
 	for (int32 Index = 0; Index < PathBlocks.Num(); ++Index)
 	{
 		const FVehicleAutopilotBlockReference& Block = PathBlocks[Index];
@@ -269,14 +290,31 @@ bool FBetterJunctionsHooks::FilterBlocksBeyondStandingVehicle(const UFGVehicleAu
 			OutKept.Add(Block);
 			continue;
 		}
-		// Priority: a junction claimed by a truck that has waited long enough on it is not booked
-		// by anyone else until that truck is in.
-		if (!bInsideJunction && GPriority.Num() > 0)
+		const bool bJunction = IsJunction(Block);
+		if (!bJunction)
 		{
-			const AFGVehiclePathSegment* Segment = ResolveSegment(Autopilot, Block, NodeOffset);
-			const TWeakObjectPtr<const UFGVehicleAutopilotComponent>* Waiter = Segment ? GPriority.Find(Segment) : nullptr;
+			JunctionStart = INDEX_NONE;
+		}
+		else if (JunctionStart == INDEX_NONE)
+		{
+			JunctionStart = Index;
+		}
+		// Priority: a junction block claimed by a truck that has waited long enough on it is not
+		// booked by anyone else until that truck is in. The whole junction is given up then, from
+		// its entry: booking it up to the claimed block would leave the truck standing inside it.
+		if (!bInsideJunction && bJunction && GPriority.Num() > 0)
+		{
+			FVehiclePathBlockReference Key;
+			Key.Segment = const_cast<AFGVehiclePathSegment*>(ResolveSegment(Autopilot, Block, NodeOffset));
+			Key.PathBlockIndex = Block.PathBlockIndex;
+			const TWeakObjectPtr<const UFGVehicleAutopilotComponent>* Waiter = Key.Segment ? GPriority.Find(Key) : nullptr;
 			if (Waiter && Waiter->IsValid() && Waiter->Get() != Autopilot)
 			{
+				OutKept.SetNum(FMath::Min(OutKept.Num(), JunctionStart));
+				if (!OutKept.Contains(Current) && PathBlocks.Contains(Current))
+				{
+					OutKept.Add(Current);
+				}
 				Reason = TEXT("junction claimed by a waiting truck");
 				Room = 0.0f;
 				break;
@@ -294,7 +332,7 @@ bool FBetterJunctionsHooks::FilterBlocksBeyondStandingVehicle(const UFGVehicleAu
 		}
 		// Entering a junction: the first junction block after a non-junction one. A truck already
 		// inside one (its current block is a junction block) has to leave it, so no check there.
-		if (NodeOffset != INDEX_NONE && IsJunction(Block) && !IsJunction(Index > 0 ? PathBlocks[Index - 1] : Current))
+		if (NodeOffset != INDEX_NONE && bJunction && !IsJunction(Index > 0 ? PathBlocks[Index - 1] : Current) && SlowLeaders.Num() > 0)
 		{
 			float ExitDistance = -1.0f;
 			for (int32 Later = Index + 1; Later < PathBlocks.Num(); ++Later)
@@ -312,10 +350,20 @@ bool FBetterJunctionsHooks::FilterBlocksBeyondStandingVehicle(const UFGVehicleAu
 				ExitDistance = Autopilot->CalculateTotalDistanceBetweenPathBlocks(Current, PathBlocks.Last())
 					+ (LastSegment ? LastSegment->GetVehiclePathBlockSize() : 0.0f);
 			}
-			if (SlowDistance < ExitDistance + 2.0f * HalfLength + JunctionExitMargin)
+			// A slow vehicle whose rear is past the exit is a queue the truck would end up standing
+			// in the junction behind; one still inside counts only while it stands.
+			float QueueDistance = TNumericLimits<float>::Max();
+			for (const FSlowLeader& Leader : SlowLeaders)
+			{
+				if (Leader.bStanding || Leader.Distance + LeaderRearOffset >= ExitDistance)
+				{
+					QueueDistance = FMath::Min(QueueDistance, Leader.Distance);
+				}
+			}
+			if (QueueDistance < ExitDistance + 2.0f * HalfLength + JunctionExitMargin)
 			{
 				Reason = TEXT("junction exit not clear");
-				Room = SlowDistance;
+				Room = QueueDistance;
 				break;
 			}
 		}
@@ -579,17 +627,22 @@ void FBetterJunctionsHooks::RebuildPriority(AFGVehicleSubsystem* Subsystem)
 			continue;
 		}
 		const int32 NodeOffset = NodeIndexOffset(Waiter.Autopilot, Current);
-		// The sequence's own segments, and the segments of every block overlapping them: those
-		// are what the passing traffic books.
-		TSet<const AFGVehiclePathSegment*> Claimed;
+		// The junction blocks of the sequence, and every block overlapping them: those are what
+		// the passing traffic books. The sequence's last block lies on the road past the exit and
+		// is left out: only the junction leads onto it, and claiming it stopped the trucks that
+		// had just left the junction on that road.
+		TSet<FVehiclePathBlockReference> Claimed;
 		for (const FVehicleAutopilotBlockReference& Ref : Waiter.Autopilot->mNextBlockSequenceReference.GetValue())
 		{
 			const AFGVehiclePathSegment* Segment = ResolveSegment(Waiter.Autopilot, Ref, NodeOffset);
-			if (!Segment)
+			if (!Segment || !Segment->IsJunctionBlock())
 			{
 				continue;
 			}
-			Claimed.Add(Segment);
+			FVehiclePathBlockReference Own;
+			Own.Segment = const_cast<AFGVehiclePathSegment*>(Segment);
+			Own.PathBlockIndex = Ref.PathBlockIndex;
+			Claimed.Add(Own);
 			FReadScopeLock Lock(Segment->mPathBlocksLock);
 			const TArray<FVehiclePathBlock>& Blocks = Segment->GetVehiclePathBlocks();
 			if (Blocks.IsValidIndex(Ref.PathBlockIndex))
@@ -598,15 +651,15 @@ void FBetterJunctionsHooks::RebuildPriority(AFGVehicleSubsystem* Subsystem)
 				{
 					if (IsValid(Over.Segment))
 					{
-						Claimed.Add(Over.Segment);
+						Claimed.Add(Over);
 					}
 				}
 			}
 		}
 		bool bTaken = false;
-		for (const AFGVehiclePathSegment* Segment : Claimed)
+		for (const FVehiclePathBlockReference& Block : Claimed)
 		{
-			if (GPriority.Contains(Segment))
+			if (GPriority.Contains(Block))
 			{
 				bTaken = true;
 				break;
@@ -616,14 +669,14 @@ void FBetterJunctionsHooks::RebuildPriority(AFGVehicleSubsystem* Subsystem)
 		{
 			continue;
 		}
-		for (const AFGVehiclePathSegment* Segment : Claimed)
+		for (const FVehiclePathBlockReference& Block : Claimed)
 		{
-			GPriority.Add(Segment, Waiter.Autopilot);
+			GPriority.Add(Block, Waiter.Autopilot);
 		}
 		Holding.Add(Waiter.Autopilot);
 		if (!GPriorityLogged.Contains(Waiter.Autopilot))
 		{
-			UE_LOG(LogBetterJunctions, Display, TEXT("%s: priority at its junction after %.0f s of waiting, %d segment(s) claimed"),
+			UE_LOG(LogBetterJunctions, Display, TEXT("%s: priority at its junction after %.0f s of waiting, %d block(s) claimed"),
 				*VehicleLabel(Waiter.Autopilot), Waiter.Seconds, Claimed.Num());
 		}
 	}
